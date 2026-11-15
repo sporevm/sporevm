@@ -233,8 +233,9 @@ so a size match means the bucket already has it. One `aws s3 sync` uploads
 about 400 small objects a second, so a push runs up to eight at once for
 `objects/`, each with an `--include` pattern for the objects whose digests
 start with one of two hex digits. Each of them lists the store's `objects/`.
-aws matches a pattern against the whole staged path, so a rootfs cache whose
-path contains `*`, `?` or `[` gets one sync without a pattern. Before it stages packs it
+aws matches a pattern against the whole staged path, where `--exclude` fails
+to match under a rootfs cache whose path contains `*`, `?` or `[`, so such a
+cache gets one sync without a pattern. Before it stages packs it
 lists the store's with `aws s3api list-objects-v2` and assembles only those
 the store lacks, so a push needs local space for its new packs. Credentials appear only in
 the request signature and the session token header; refs, log lines, errors

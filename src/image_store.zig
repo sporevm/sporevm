@@ -460,8 +460,9 @@ fn pushS3(
         .uploads = &uploads,
     };
     var slices: std.ArrayList(?[]const u8) = .empty;
-    // aws matches a pattern against the whole staged path, so a path with
-    // pattern characters of its own gets one sync without a pattern.
+    // aws matches a pattern against the whole staged path. In a path with
+    // pattern characters of its own `--exclude *` matches nothing, and every
+    // sync would upload every object, so such a path gets one sync.
     if (std.mem.indexOfAny(u8, stage, "*?[") != null) {
         try slices.append(arena, null);
     } else for (object_sync_slices) |slice| {
@@ -1790,11 +1791,11 @@ pub const TestImage = struct {
     }
 
     /// A fake aws CLI that keeps S3 in the fixture's `bucket` directory, with
-    /// `sync --size-only` semantics. With an `--include` pattern it syncs
-    /// only the files whose whole source path matches the source directory
-    /// followed by the pattern, as aws does. It logs each command to
-    /// `aws.log`, and a sync to `.../<dir>` fails while `bucket/fail-<dir>`
-    /// exists.
+    /// `sync --size-only` semantics. With `--exclude * --include PATTERN` it
+    /// skips the files that `*` matches and PATTERN does not, and like aws
+    /// it matches each against the whole source path, as the source
+    /// directory followed by the pattern. It logs each command to `aws.log`,
+    /// and a sync to `.../<dir>` fails while `bucket/fail-<dir>` exists.
     pub fn fakeAws(self: *TestImage) ![]const u8 {
         const allocator = self.arena.allocator();
         const io = std.testing.io;
@@ -1827,7 +1828,7 @@ pub const TestImage = struct {
             \\    done
             \\    (cd "$src" && find . -type f | sort) | while read -r file; do
             \\      file="${{file#./}}"
-            \\      [[ -z "$include" || "$src/$file" == $src/$include ]] || continue
+            \\      if [[ -n "$include" && "$src/$file" == $src/* && "$src/$file" != $src/$include ]]; then continue; fi
             \\      if [[ -f "$dst/$file" && $(wc -c < "$dst/$file") == $(wc -c < "$src/$file") ]]; then continue; fi
             \\      mkdir -p "$(dirname "$dst/$file")"
             \\      cp "$src/$file" "$dst/$file"
@@ -2033,15 +2034,16 @@ test "a store image resolves into an empty cache with only its metadata" {
     try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform, &fixture.env));
 }
 
-test "image push to S3 from a cache whose path has pattern characters uploads every object with one sync" {
+test "image push to S3 from a cache whose path has pattern characters uploads each object once, with one sync" {
     var fixture: TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
     const allocator = fixture.arena.allocator();
     const io = std.testing.io;
     const aws = try fixture.fakeAws();
-    // aws would match `--include blake3/[01]*` against this whole path, in
-    // which `[1]` matches only `1`, and upload nothing.
+    // aws would match `--exclude *` against this whole path, in which `[1]`
+    // matches only `1`, exclude nothing, and upload every object from every
+    // sync.
     const cache = try fixture.path("cache[1]");
     try Io.Dir.cwd().rename(fixture.env.get(local_paths.rootfs_cache_env).?, Io.Dir.cwd(), cache, io);
     try fixture.env.put(local_paths.rootfs_cache_env, cache);
