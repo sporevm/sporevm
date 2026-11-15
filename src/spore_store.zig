@@ -502,8 +502,8 @@ test "spore checkpoint push to S3 uploads objects, then the manifest, then the t
     const spores_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/spores" };
     const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/spore-tags/warm" };
     // The disk's packs follow its objects; the second push uploads none.
-    inline for (.{ .{ packs_list, packs_sync, spores_sync }, .{ packs_list, spores_sync, tag_copy } }) |after_objects| {
-        try fixture.expectObjectSyncs(&lines, store);
+    inline for (.{ .{ packs_list, packs_sync, spores_sync }, .{ packs_list, spores_sync, tag_copy } }, .{ 6, 0 }) |after_objects, uploads| {
+        try image_store.TestImage.expectObjectUploads(&lines, uploads);
         inline for (after_objects) |expected| {
             const line = lines.next() orelse return error.TestExpectedAwsCommand;
             try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
