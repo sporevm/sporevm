@@ -229,7 +229,12 @@ the rootfs cache with hard links to the cached objects, releases the cache
 lock, verifies the staged objects, and uploads with the aws CLI and its own credential chain: `aws s3 sync
 --size-only` for `objects/`, then for `packs/`, then for `images/`, then `aws s3 cp` for the tag,
 so a reader never sees a tag before its image. An object's key is its digest,
-so a size match means the bucket already has it. Before it stages packs it
+so a size match means the bucket already has it. One `aws s3 sync` uploads
+about 400 small objects a second, so a push runs up to eight at once for
+`objects/`, each with an `--include` pattern for the objects whose digests
+start with one of two hex digits. Each of them lists the store's `objects/`.
+aws matches a pattern against the whole staged path, so a rootfs cache whose
+path contains `*`, `?` or `[` gets one sync without a pattern. Before it stages packs it
 lists the store's with `aws s3api list-objects-v2` and assembles only those
 the store lacks, so a push needs local space for its new packs. Credentials appear only in
 the request signature and the session token header; refs, log lines, errors

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `spore image push` and `spore checkpoint push` to S3 upload objects with up
+  to eight `aws s3 sync` processes at once instead of one, and verify staged
+  objects and assemble packs on several threads.
+
 ## v0.19.0
 
 - `spore image push` and `spore checkpoint push` also write a disk's objects
