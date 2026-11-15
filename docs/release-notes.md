@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+## v0.19.1
+
 - `spore image push` and `spore checkpoint push` to S3 list the objects the
   store holds and upload only the missing ones, with up to eight
   `aws s3 cp --recursive` at once, instead of one `aws s3 sync` that lists
   and compares the whole store in one process. They also verify staged
-  objects and assemble packs on several threads.
+  objects and assemble packs on several threads. In a KVM ARM64 trial with
+  the aws CLI's default settings, the first push of an 18.8 GB checkpoint
+  took 178 seconds instead of 978, and pushing it again took 18 seconds
+  instead of 104.
 
 ## v0.19.0
 
