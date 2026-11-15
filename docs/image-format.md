@@ -226,12 +226,16 @@ tag or object as access denied rather than not found, and either fails closed.
 
 `spore image push local/app:1 s3://bucket/images/app` stages the store under
 the rootfs cache with hard links to the cached objects, releases the cache
-lock, verifies the staged objects, and uploads with the aws CLI and its own credential chain: `aws s3 sync
---size-only` for `objects/`, then for `packs/`, then for `images/`, then `aws s3 cp` for the tag,
-so a reader never sees a tag before its image. An object's key is its digest,
-so a size match means the bucket already has it. Before it stages packs it
-lists the store's with `aws s3api list-objects-v2` and assembles only those
-the store lacks, so a push needs local space for its new packs. Credentials appear only in
+lock, verifies the staged objects, and uploads with the aws CLI and its own
+credential chain: `objects/`, then `packs/`, then `images/`, then the tag, so
+a reader never sees a tag before its image. It lists what the store holds
+under `objects/` and `packs/` with `aws s3api list-objects-v2`. An object's
+or pack's key is its digest, so a size match means the bucket already has it.
+It uploads the objects the store lacks with up to eight
+`aws s3 cp --recursive` at once, because one aws process sends only a few
+hundred small objects a second. It assembles only the packs the store lacks,
+so a push needs local space for its new packs, and uploads them and `images/`
+with `aws s3 sync --size-only`, then the tag with `aws s3 cp`. Credentials appear only in
 the request signature and the session token header; refs, log lines, errors
 and the catalog's origin show only the `s3://` URL.
 

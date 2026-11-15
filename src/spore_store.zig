@@ -221,7 +221,7 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
     try Io.Dir.cwd().createDirPath(io, chunks_dir);
 
     var ram_fetch: RamFetch = .{ .io = io, .client = &client, .dir = chunks_dir };
-    try image_store.fillEach(image_store.Object, io, ram_objects.items, null, &ram_fetch, RamFetch.fetch);
+    try image_store.fillEach(image_store.Object, io, ram_objects.items, image_store.fill_concurrency, null, &ram_fetch, RamFetch.fetch);
     ram.objects = ram_objects.items.len;
     ram.objects_fetched = ram.objects;
 
@@ -496,20 +496,22 @@ test "spore checkpoint push to S3 uploads objects, then the manifest, then the t
     try std.testing.expectEqual(@as(usize, 0), pushed.objects_written);
     const commands = try Io.Dir.cwd().readFileAlloc(io, try fixture.path("aws.log"), allocator, .limited(64 * 1024));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, commands, "\n"), '\n');
-    const objects_sync = .{ "s3 sync --size-only --no-progress ", " s3://bucket-1/team/objects" };
+    const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
     const packs_list = .{ "s3api list-objects-v2 --bucket bucket-1 --prefix team/packs/blake3/ ", " --output text" };
     const packs_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/packs" };
     const spores_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/spores" };
     const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/spore-tags/warm" };
     // The disk's packs follow its objects; the second push uploads none.
-    inline for (.{ objects_sync, packs_list, packs_sync, spores_sync, objects_sync, packs_list, spores_sync, tag_copy }) |expected| {
-        const line = lines.next() orelse return error.TestExpectedAwsCommand;
-        try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
-        try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
+    inline for (.{ .{ packs_list, packs_sync, spores_sync }, .{ packs_list, spores_sync, tag_copy } }, .{ 6, 0 }) |after_objects, uploads| {
+        try image_store.TestImage.expectObjectUploads(&lines, uploads);
+        inline for (after_objects) |expected| {
+            const line = lines.next() orelse return error.TestExpectedAwsCommand;
+            try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
+            try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
+        }
     }
     try std.testing.expectEqual(null, lines.next());
 
-    const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
     const files = try fixture.listStore(store);
     try std.testing.expectEqual(@as(usize, 9), files.len);
     // The disk's objects in one pack; RAM chunks and the index are not packed.

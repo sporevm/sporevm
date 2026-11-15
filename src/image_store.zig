@@ -449,16 +449,37 @@ fn pushS3(
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = file.bytes });
     }
     cache_lock.deinit();
-    for (linked.items) |object| allocator.free(try rootfs_cas.readVerifiedChunkPath(allocator, object.path, object.digest, object.size));
+    try fillEach(PushObject, io, linked.items, fill_concurrency, null, {}, verifyStaged);
 
     const base = destination.base.url;
-    try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--no-progress", try std.fs.path.join(arena, &.{ stage, "objects" }), try std.fmt.allocPrint(arena, "{s}/objects", .{base}) }, &uploads);
+    const key_prefix = if (destination.base.prefix.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{destination.base.prefix[1..]});
+    // Upload only the objects the store lacks. `aws s3 sync` would list and
+    // compare the whole store in one process, which also uploads only a few
+    // hundred small objects a second.
+    var listing: ObjectListing = .{ .io = io, .aws = aws, .bucket = destination.base.bucket, .key_prefix = try std.fmt.allocPrint(arena, "{s}objects/blake3/", .{key_prefix}) };
+    defer listing.deinit();
+    try fillEach(u8, io, "0123456789abcdef", aws_processes, null, &listing, ObjectListing.run);
+    var upload: ObjectUpload = .{ .io = io, .aws = aws, .stage = stage, .destination = try std.fmt.allocPrint(arena, "{s}/objects", .{base}), .uploads = &uploads };
+    var missing: usize = 0;
+    for (closure.objects) |object| {
+        const hex = object.digest[digest_prefix.len..];
+        if (listing.size(hex) == object.size) continue;
+        const dir = try upload.dirAlloc(arena, missing % aws_processes);
+        if (missing < aws_processes) try Io.Dir.cwd().createDirPath(io, dir);
+        const staged = try std.fs.path.join(arena, &.{ objects_dir, hex });
+        Io.Dir.cwd().hardLink(staged, Io.Dir.cwd(), try std.fs.path.join(arena, &.{ dir, hex }), io, .{}) catch |err| switch (err) {
+            // The closure names the object twice.
+            error.PathAlreadyExists => continue,
+            else => |e| return e,
+        };
+        missing += 1;
+    }
+    try fillEach(usize, io, upload_indexes[0..@min(missing, aws_processes)], aws_processes, null, &upload, ObjectUpload.run);
     if (closure.packs.len != 0) {
         // Stage only the packs the store lacks: a pack is megabytes, and a
         // disk shares most of its packs with the image it started from.
-        var stored: StoredPacks = .{ .arena = arena };
-        const prefix = try std.fmt.allocPrint(arena, "{s}packs/blake3/", .{if (destination.base.prefix.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{destination.base.prefix[1..]})});
-        try runAws(io, arena, aws, &.{ "s3api", "list-objects-v2", "--bucket", destination.base.bucket, "--prefix", prefix, "--query", "Contents[].[Key,Size]", "--output", "text" }, &stored);
+        var stored: StoredFiles = .{ .arena = arena };
+        try stored.list(io, arena, aws, destination.base.bucket, try std.fmt.allocPrint(arena, "{s}packs/blake3/", .{key_prefix}));
         if (try writeMissingPacks(io, allocator, stage, closure.packs, &stored) != 0) {
             try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, "packs" }), try std.fmt.allocPrint(arena, "{s}/packs", .{base}) }, null);
         }
@@ -472,35 +493,111 @@ fn pushS3(
         },
         .digest => {},
     }
-    return .{ .objects = uploads.count, .bytes = uploads.bytes };
+    return .{ .objects = uploads.count.load(.monotonic), .bytes = uploads.bytes.load(.monotonic) };
 }
 
 /// Counts the objects `aws s3 sync` uploads from the lines it prints:
 /// `upload: <local path> to s3://<bucket>/<prefix>/objects/blake3/<hex>`.
 const Uploads = struct {
-    /// Object sizes by digest hex.
+    /// Object sizes by digest hex. Not changed while uploads run.
     sizes: std.StringHashMapUnmanaged(u64) = .empty,
-    count: usize = 0,
-    bytes: u64 = 0,
+    count: std.atomic.Value(usize) = .init(0),
+    bytes: std.atomic.Value(u64) = .init(0),
 
+    /// Called from every `ObjectUpload.run` at once.
     fn line(self: *Uploads, text: []const u8) !void {
         if (!std.mem.startsWith(u8, text, "upload: ")) return;
         const key = std.mem.trimEnd(u8, text, "\r");
         const size = self.sizes.get(key[(std.mem.lastIndexOfScalar(u8, key, '/') orelse return) + 1 ..]) orelse return;
-        self.count += 1;
-        self.bytes += size;
+        _ = self.count.fetchAdd(1, .monotonic);
+        _ = self.bytes.fetchAdd(size, .monotonic);
     }
 };
 
-/// The packs an S3 store holds, from the lines `aws s3api list-objects-v2
-/// --query 'Contents[].[Key,Size]' --output text` prints: `<key>\t<size>`,
-/// or `None` for a page without objects.
-const StoredPacks = struct {
+/// aws CLI processes an S3 push runs at once to list a store's objects and
+/// to upload objects. S3 takes 3,500 writes a second per prefix, and one
+/// process sends a few hundred small objects a second.
+const aws_processes = 8;
+
+const upload_indexes = blk: {
+    var indexes: [aws_processes]usize = undefined;
+    for (&indexes, 0..) |*index, i| index.* = i;
+    break :blk indexes;
+};
+
+/// The objects an S3 store holds, listed by the first hex digit of their
+/// names so that `aws_processes` listings run at once.
+const ObjectListing = struct {
+    io: Io,
+    aws: []const u8,
+    bucket: []const u8,
+    /// The key of the store's `objects/blake3/`.
+    key_prefix: []const u8,
+    arenas: [16]std.heap.ArenaAllocator = @splat(.init(std.heap.smp_allocator)),
+    /// By first hex digit. Each `run` writes its own.
+    stored: [16]StoredFiles = undefined,
+
+    fn deinit(self: *ObjectListing) void {
+        for (&self.arenas) |*arena| arena.deinit();
+    }
+
+    /// List the objects whose names start with `digit`.
+    fn run(self: *ObjectListing, digit: u8) !void {
+        const allocator = std.heap.smp_allocator;
+        const i = std.fmt.charToDigit(digit, 16) catch unreachable;
+        self.stored[i] = .{ .arena = self.arenas[i].allocator() };
+        const prefix = try std.fmt.allocPrint(allocator, "{s}{c}", .{ self.key_prefix, digit });
+        defer allocator.free(prefix);
+        try self.stored[i].list(self.io, allocator, self.aws, self.bucket, prefix);
+    }
+
+    /// The stored size of the object `hex`, once every `run` has returned.
+    fn size(self: *const ObjectListing, hex: []const u8) ?u64 {
+        return self.stored[std.fmt.charToDigit(hex[0], 16) catch return null].sizes.get(hex);
+    }
+};
+
+/// The uploads of the staged objects an S3 store lacks, which are linked
+/// into `aws_processes` directories that each get one `aws s3 cp`.
+const ObjectUpload = struct {
+    io: Io,
+    aws: []const u8,
+    stage: []const u8,
+    /// The store's `objects` URL.
+    destination: []const u8,
+    uploads: *Uploads,
+
+    /// The directory whose `blake3/` holds the objects of upload `index`.
+    fn dirAlloc(self: *const ObjectUpload, allocator: std.mem.Allocator, index: usize) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/upload/{d}/blake3", .{ self.stage, index });
+    }
+
+    fn run(self: *ObjectUpload, index: usize) !void {
+        const allocator = std.heap.smp_allocator;
+        const dir = try self.dirAlloc(allocator, index);
+        defer allocator.free(dir);
+        try runAws(self.io, allocator, self.aws, &.{ "s3", "cp", "--recursive", "--no-progress", std.fs.path.dirname(dir).?, self.destination }, self.uploads);
+    }
+};
+
+fn verifyStaged(_: void, object: PushObject) !void {
+    const allocator = std.heap.smp_allocator;
+    allocator.free(try rootfs_cas.readVerifiedChunkPath(allocator, object.path, object.digest, object.size));
+}
+
+/// The objects or packs an S3 store holds under a key prefix, from the lines
+/// `aws s3api list-objects-v2 --query 'Contents[].[Key,Size]' --output text`
+/// prints: `<key>\t<size>`, or `None` for a page without objects.
+const StoredFiles = struct {
     arena: std.mem.Allocator,
-    /// Pack sizes by name.
+    /// Sizes by name, which is a digest in hex.
     sizes: std.StringHashMapUnmanaged(u64) = .empty,
 
-    fn line(self: *StoredPacks, text: []const u8) !void {
+    fn list(self: *StoredFiles, io: Io, allocator: std.mem.Allocator, aws: []const u8, bucket: []const u8, key_prefix: []const u8) !void {
+        try runAws(io, allocator, aws, &.{ "s3api", "list-objects-v2", "--bucket", bucket, "--prefix", key_prefix, "--query", "Contents[].[Key,Size]", "--output", "text" }, self);
+    }
+
+    fn line(self: *StoredFiles, text: []const u8) !void {
         const tab = std.mem.indexOfScalar(u8, text, '\t') orelse return;
         const key = text[0..tab];
         const name = key[if (std.mem.lastIndexOfScalar(u8, key, '/')) |slash| slash + 1 else 0..];
@@ -515,39 +612,53 @@ const StoredPacks = struct {
 /// from the objects in `<dir>/objects/blake3/`, each verified as it is read.
 /// The store has a pack when `stored` lists it, or without `stored` when
 /// `dir` holds it, at the pack's size. Returns how many it wrote.
-fn writeMissingPacks(io: Io, allocator: std.mem.Allocator, dir: []const u8, packs: []const store_pack.Pack, stored: ?*const StoredPacks) !usize {
+fn writeMissingPacks(io: Io, allocator: std.mem.Allocator, dir: []const u8, packs: []const store_pack.Pack, stored: ?*const StoredFiles) !usize {
     if (packs.len == 0) return 0;
     const packs_dir = try std.fs.path.join(allocator, &.{ dir, "packs", "blake3" });
     defer allocator.free(packs_dir);
     try chunk_sealer.ensureDirPath(allocator, packs_dir);
-    var bytes: std.ArrayList(u8) = .empty;
-    defer bytes.deinit(allocator);
-    var written: usize = 0;
-    for (packs) |pack| {
-        const path = try std.fs.path.join(allocator, &.{ packs_dir, &pack.name });
+    var writer: PackWriter = .{ .io = io, .dir = dir, .stored = stored };
+    try fillEach(store_pack.Pack, io, packs, pack_writers, null, &writer, PackWriter.write);
+    return writer.written.load(.monotonic);
+}
+
+/// Packs assembled at once, each of which is in memory whole: at most
+/// `pack_writers * store_pack.max_pack_bytes`.
+const pack_writers = 8;
+
+const PackWriter = struct {
+    io: Io,
+    dir: []const u8,
+    stored: ?*const StoredFiles,
+    written: std.atomic.Value(usize) = .init(0),
+
+    fn write(self: *PackWriter, pack: store_pack.Pack) !void {
+        const allocator = std.heap.smp_allocator;
+        const path = try std.fs.path.join(allocator, &.{ self.dir, "packs", "blake3", &pack.name });
         defer allocator.free(path);
-        const size: ?u64 = if (stored) |listing|
+        const size: ?u64 = if (self.stored) |listing|
             listing.sizes.get(&pack.name)
-        else if (Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })) |stat|
+        else if (Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false })) |stat|
             (if (stat.kind == .file) stat.size else null)
         else |err| switch (err) {
             error.FileNotFound => null,
             else => |e| return e,
         };
-        if (size == pack.len()) continue;
-        bytes.clearRetainingCapacity();
+        if (size == pack.len()) return;
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(allocator);
+        try bytes.ensureTotalCapacityPrecise(allocator, @intCast(pack.len()));
         for (pack.members) |member| {
-            const object = try std.fs.path.join(allocator, &.{ dir, "objects", "blake3", &member.id.toHex() });
+            const object = try std.fs.path.join(allocator, &.{ self.dir, "objects", "blake3", &member.id.toHex() });
             defer allocator.free(object);
             const data = try rootfs_cas.readVerifiedChunkPath(allocator, object, &member.id.toDigest(), member.len);
             defer allocator.free(data);
-            try bytes.appendSlice(allocator, data);
+            bytes.appendSliceAssumeCapacity(data);
         }
         try chunk_sealer.replaceFileAtomicDurable(allocator, path, bytes.items, 0o444);
-        written += 1;
+        _ = self.written.fetchAdd(1, .monotonic);
     }
-    return written;
-}
+};
 
 /// Run `aws ARGS...` and fail unless it exits 0. Its errors go to stderr;
 /// `sink.line` takes each line it prints on stdout, unless `sink` is null.
@@ -1337,7 +1448,7 @@ pub const Fetcher = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const missing = try self.missingSpans(arena_state.allocator());
-        try fillEach(Span, self.io, missing, &self.canceled, self, fillSpan);
+        try fillEach(Span, self.io, missing, fill_concurrency, &self.canceled, self, fillSpan);
         self.complete.store(true, .release);
         var objects: usize = 0;
         for (missing) |span| objects += span.objects.len;
@@ -1463,14 +1574,15 @@ pub const Fetcher = struct {
     }
 };
 
-/// Run `work(context, object)` for each of `objects`, up to `fill_concurrency`
-/// at once with this thread among the workers, and return the first failure.
+/// Run `work(context, object)` for each of `objects`, up to `limit` at once
+/// with this thread among the workers, and return the first failure.
 /// Workers stop at a failure, or with `ImageStoreFetchCanceled` once
 /// `canceled` is set.
 pub fn fillEach(
     comptime T: type,
     io: Io,
     objects: []const T,
+    limit: usize,
     canceled: ?*const std.atomic.Value(bool),
     context: anytype,
     comptime work: anytype,
@@ -1505,7 +1617,7 @@ pub fn fillEach(
     };
     var fill: Fill = .{ .io = io, .objects = objects, .canceled = canceled, .context = context };
     var group: Io.Group = .init;
-    for (0..@min(fill_concurrency, objects.len) -| 1) |_| {
+    for (0..@min(limit, objects.len) -| 1) |_| {
         group.concurrent(io, Fill.run, .{&fill}) catch break;
     }
     Fill.run(&fill) catch {};
@@ -1691,6 +1803,27 @@ pub const TestImage = struct {
         return std.mem.concat(self.arena.allocator(), u8, &.{ self.rootfs_bytes[0..chunk_size], self.rootfs_bytes[2 * chunk_size ..] });
     }
 
+    /// Take from `lines` the aws commands of one push's objects to
+    /// `s3://bucket-1/team`: a listing for each first hex digit of an object
+    /// name, in any order, then `uploads` recursive copies.
+    pub fn expectObjectUploads(lines: *std.mem.SplitIterator(u8, .scalar), uploads: usize) !void {
+        const list = "s3api list-objects-v2 --bucket bucket-1 --prefix team/objects/blake3/";
+        var listed: [16]bool = @splat(false);
+        for (0..16) |_| {
+            const line = lines.next() orelse return error.TestExpectedAwsCommand;
+            try std.testing.expect(std.mem.startsWith(u8, line, list));
+            try std.testing.expectEqual(' ', line[list.len + 1]);
+            const digit = try std.fmt.charToDigit(line[list.len], 16);
+            try std.testing.expect(!listed[digit]);
+            listed[digit] = true;
+        }
+        for (0..uploads) |_| {
+            const line = lines.next() orelse return error.TestExpectedAwsCommand;
+            try std.testing.expect(std.mem.startsWith(u8, line, "s3 cp --recursive --no-progress "));
+            try std.testing.expect(std.mem.endsWith(u8, line, " s3://bucket-1/team/objects"));
+        }
+    }
+
     /// Remove the packs of `store`, which leaves a store as releases before
     /// packs wrote it: an object's only copy is its `objects/` file.
     pub fn dropPacks(self: *TestImage, store: []const u8) !void {
@@ -1722,7 +1855,7 @@ pub const TestImage = struct {
             \\    while read -r file; do
             \\      found=1
             \\      printf '%s\t%s\n' "${{file#"$root/$4/"}}" "$(wc -c < "$file" | tr -d ' ')"
-            \\    done < <(find "$root/$4/$6" -type f 2>/dev/null | sort)
+            \\    done < <(find "$root/$4" -type f -path "$root/$4/$6*" 2>/dev/null | sort)
             \\    [[ $found == 1 ]] || echo None ;;
             \\  "s3 sync")
             \\    if [[ -e "$root/fail-${{url##*/}}" ]]; then exit 1; fi
@@ -1733,7 +1866,17 @@ pub const TestImage = struct {
             \\      cp "$src/$file" "$dst/$file"
             \\      [[ " $* " == *" --only-show-errors "* ]] || echo "upload: $src/$file to $url/$file"
             \\    done ;;
-            \\  "s3 cp") mkdir -p "$(dirname "$dst")"; cp "$src" "$dst" ;;
+            \\  "s3 cp")
+            \\    if [[ "$3" == --recursive ]]; then
+            \\      (cd "$src" && find . -type f | sort) | while read -r file; do
+            \\        file="${{file#./}}"
+            \\        mkdir -p "$(dirname "$dst/$file")"
+            \\        cp "$src/$file" "$dst/$file"
+            \\        echo "upload: $src/$file to $url/$file"
+            \\      done
+            \\    else
+            \\      mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
+            \\    fi ;;
             \\  *) exit 2 ;;
             \\esac
             \\
@@ -1851,22 +1994,25 @@ test "image push to S3 uploads objects, then the image, then the tag, with the a
     try std.testing.expectEqual(@as(usize, 0), pushed.objects_written);
     const commands = try Io.Dir.cwd().readFileAlloc(io, log, allocator, .limited(64 * 1024));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, commands, "\n"), '\n');
-    const objects_sync = .{ "s3 sync --size-only --no-progress ", " s3://bucket-1/team/objects" };
+    const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
     const packs_list = .{ "s3api list-objects-v2 --bucket bucket-1 --prefix team/packs/blake3/ ", " --output text" };
     const packs_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/packs" };
     const images_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/images" };
     const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/tags/1" };
-    // The second push lists the pack the first uploaded and uploads none.
-    inline for (.{ objects_sync, packs_list, packs_sync, images_sync, objects_sync, packs_list, images_sync, tag_copy }) |expected| {
-        const line = lines.next() orelse return error.TestExpectedAwsCommand;
-        try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
-        try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
+    // The first push uploads each of its three objects from a directory of
+    // its own. The second lists them and the pack, and uploads none.
+    inline for (.{ .{ packs_list, packs_sync, images_sync }, .{ packs_list, images_sync, tag_copy } }, .{ 3, 0 }) |after_objects, uploads| {
+        try TestImage.expectObjectUploads(&lines, uploads);
+        inline for (after_objects) |expected| {
+            const line = lines.next() orelse return error.TestExpectedAwsCommand;
+            try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
+            try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
+        }
     }
     try std.testing.expectEqual(null, lines.next());
 
     // The bucket is a store: it reads back as one, and a fresh object
     // upload is counted from what the CLI reports.
-    const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
     const consumer = try fixture.path("consumer-cache");
     const local = try resolve(io, allocator, consumer, try std.fmt.allocPrint(allocator, "{s}/1", .{store}), .{}, &fixture.env);
     try std.testing.expectEqualStrings(fixture.identity, local.identity);
@@ -2629,7 +2775,7 @@ test "filling a cache reads an object's own file when a pack cannot supply it" {
 fn fuzzStoredPackLine(_: void, smith: *std.testing.Smith) !void {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    var stored: StoredPacks = .{ .arena = arena_state.allocator() };
+    var stored: StoredFiles = .{ .arena = arena_state.allocator() };
     var buf: [256]u8 = undefined;
     try stored.line(buf[0..smith.slice(&buf)]);
     var names = stored.sizes.keyIterator();
@@ -2643,7 +2789,7 @@ test "fuzz stored pack listing line" {
 test "a pack listing takes each pack's name and size and skips every other line" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    var stored: StoredPacks = .{ .arena = arena_state.allocator() };
+    var stored: StoredFiles = .{ .arena = arena_state.allocator() };
     const name = test_support.repeat("0123456789abcdef", 4);
     for ([_][]const u8{
         "team/packs/blake3/" ++ name ++ "\t4096",
