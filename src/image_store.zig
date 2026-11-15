@@ -453,9 +453,9 @@ fn pushS3(
 
     const base = destination.base.url;
     const key_prefix = if (destination.base.prefix.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{destination.base.prefix[1..]});
-    // Upload only the objects the store lacks. `aws s3 sync` would list the
-    // whole store and compare in one process, and uploads about 400 small
-    // objects a second however many requests it may make at once.
+    // Upload only the objects the store lacks. `aws s3 sync` would list and
+    // compare the whole store in one process, which also uploads only a few
+    // hundred small objects a second.
     var listing: ObjectListing = .{ .io = io, .aws = aws, .bucket = destination.base.bucket, .key_prefix = try std.fmt.allocPrint(arena, "{s}objects/blake3/", .{key_prefix}) };
     defer listing.deinit();
     try fillEach(u8, io, "0123456789abcdef", aws_processes, null, &listing, ObjectListing.run);
@@ -474,8 +474,7 @@ fn pushS3(
         };
         missing += 1;
     }
-    const upload_dirs = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7 };
-    try fillEach(usize, io, upload_dirs[0..@min(missing, aws_processes)], aws_processes, null, &upload, ObjectUpload.run);
+    try fillEach(usize, io, upload_indexes[0..@min(missing, aws_processes)], aws_processes, null, &upload, ObjectUpload.run);
     if (closure.packs.len != 0) {
         // Stage only the packs the store lacks: a pack is megabytes, and a
         // disk shares most of its packs with the image it started from.
@@ -500,7 +499,7 @@ fn pushS3(
 /// Counts the objects `aws s3 sync` uploads from the lines it prints:
 /// `upload: <local path> to s3://<bucket>/<prefix>/objects/blake3/<hex>`.
 const Uploads = struct {
-    /// Object sizes by digest hex. Not changed while a sync runs.
+    /// Object sizes by digest hex. Not changed while uploads run.
     sizes: std.StringHashMapUnmanaged(u64) = .empty,
     count: std.atomic.Value(usize) = .init(0),
     bytes: std.atomic.Value(u64) = .init(0),
@@ -519,6 +518,12 @@ const Uploads = struct {
 /// to upload objects. S3 takes 3,500 writes a second per prefix, and one
 /// process sends a few hundred small objects a second.
 const aws_processes = 8;
+
+const upload_indexes = blk: {
+    var indexes: [aws_processes]usize = undefined;
+    for (&indexes, 0..) |*index, i| index.* = i;
+    break :blk indexes;
+};
 
 /// The objects an S3 store holds, listed by the first hex digit of their
 /// names so that `aws_processes` listings run at once.
