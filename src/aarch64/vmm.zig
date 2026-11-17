@@ -6,6 +6,7 @@
 //! restore, transport snapshot helpers, spore writing and machine restore
 //! below.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const TestDir = @import("../test_dir.zig").TestDir;
 const aarch64_topology = @import("topology.zig");
@@ -509,6 +510,12 @@ fn mapAnonymousRam(size: u64) !RamMapping {
         -1,
         0,
     );
+    // A Linux host whose transparent huge page setting is "madvise", the
+    // usual default, backs guest RAM with 2 MiB pages only when asked. The
+    // advice is best effort: a host that refuses it keeps 4 KiB pages.
+    if (comptime builtin.os.tag == .linux) {
+        std.posix.madvise(bytes.ptr, bytes.len, std.os.linux.MADV.HUGEPAGE) catch {};
+    }
     return .{ .bytes = bytes, .file_backed = false };
 }
 

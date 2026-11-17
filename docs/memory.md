@@ -145,6 +145,15 @@ VMs allocate their configured size. Elastic VMs reserve the maximum host range,
 map only the 512 MiB default (or explicit initial size) at boot, and grow the
 guest mapping when memory pressure raises the virtio-mem requested size.
 
+On Linux, SporeVM asks the host to back anonymous guest RAM with transparent
+huge pages (`madvise(MADV_HUGEPAGE)`). That covers fresh VMs and VMs restored
+from chunks. It takes effect when the host's
+`/sys/kernel/mm/transparent_hugepage/enabled` is `madvise` or `always`, and is
+ignored when it is `never`. A VM restored from a local `ram.backing` file maps
+that file privately and gets no huge pages, so a host with memory to spare runs
+many children faster from a parent pulled without `--local-ram-backing`, and a
+host short of memory fits more children with it.
+
 KVM dirty tracking uses dirty-log bitmaps plus explicit VMM-originated dirty
 marking. Single-vCPU HVF uses write-protect faults plus explicit VMM-originated
 dirty marking. Both backends seal dirty RAM through the shared `src/dirty_ram.zig`

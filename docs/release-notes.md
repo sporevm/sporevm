@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- On Linux, SporeVM asks the host to back the guest RAM of fresh VMs and of VMs
+  restored from chunks with transparent huge pages. Hosts whose
+  `transparent_hugepage/enabled` is `madvise`, the usual default, gave guests
+  no huge pages before. In a KVM ARM64 trial with 48 four-vCPU VMs running a
+  test suite at once, the suite's mean run time fell from 223 to 182 seconds.
+  An idle 512 MiB VM used 45 MiB of host memory instead of 36 MiB. VMs restored
+  from a local `ram.backing` file are unchanged. See
+  [Dirty Tracking](memory.md#dirty-tracking).
+
 ## v0.19.1
 
 - `spore image push` and `spore checkpoint push` to S3 list the objects the
