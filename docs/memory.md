@@ -54,6 +54,15 @@ changes guest MemTotal, or changes the configured vCPU count. The guest needs
 Guests configured to require page-poison preservation cannot negotiate this
 profile; no page-poison feature is offered.
 
+The physical virtqueues are inflate 0, deflate 1, and reporting 2. Linux
+6.1.191's [balloon driver](https://github.com/gregkh/linux/blob/v6.1.191/drivers/virtio/virtio_balloon.c#L496-L540)
+uses logical array slot 4 for reporting, but leaves the absent stats/hint
+names NULL. The [virtio-mmio transport](https://github.com/gregkh/linux/blob/v6.1.191/drivers/virtio/virtio_mmio.c#L438-L475)
+skips those entries and assigns consecutive physical queue indices. Do not
+reserve empty physical slots 2 and 3: the guest would not find reporting.
+The real-kernel smoke gate's reporting-off/on checkpoint comparison exercises
+this discovery path, rather than relying only on a synthetic queue setup.
+
 Linux reports free buddy blocks asynchronously, not every page freed by an
 application. Fragmented free pages and reclaimable page cache are not forced
 out. A returned page incurs fresh host allocation/zeroing faults if the guest

@@ -9,7 +9,10 @@ const queue = @import("queue.zig");
 pub const device_id: u32 = 5;
 pub const feature_reporting: u64 = 1 << 5;
 pub const reclaim_alignment: u64 = 2 * 1024 * 1024;
-// Optional stats and hint queues are absent, not reserved queue positions.
+// Linux virtio_balloon.c:init_vqs uses array slot 4 for reporting, but leaves
+// absent stats/hint names NULL. virtio_mmio.c:vm_find_vqs skips NULL names and
+// passes a consecutive queue_idx to vm_setup_vq: the physical queue is 2.
+// See docs/memory.md for the managed kernel's source references.
 pub const reporting_queue = 2;
 
 pub const Balloon = struct {
