@@ -3,34 +3,34 @@ env:
   BUILDKITE_SKIP_CHECKOUT: "true"
   BUILDKITE_BUILD_CHECKOUT_PATH: /bench
 steps:
-  - label: "HVF real builds 0 off"
+  - label: "${BENCH_BACKEND:-HVF} real builds 0 off"
     key: hvf-0
     command: python3 /bench/job.py
     agents: &benchmark
       queue: sporevm-linux-arm64
       benchmark: free-page-real-builds-t01a1f6
     timeout_in_minutes: 45
-  - label: "HVF real builds 1 on"
+  - label: "${BENCH_BACKEND:-HVF} real builds 1 on"
     key: hvf-1
     command: python3 /bench/job.py
     agents: *benchmark
     timeout_in_minutes: 45
-  - label: "HVF real builds 2 on"
+  - label: "${BENCH_BACKEND:-HVF} real builds 2 on"
     key: hvf-2
     command: python3 /bench/job.py
     agents: *benchmark
     timeout_in_minutes: 45
-  - label: "HVF real builds 3 off"
+  - label: "${BENCH_BACKEND:-HVF} real builds 3 off"
     key: hvf-3
     command: python3 /bench/job.py
     agents: *benchmark
     timeout_in_minutes: 45
-  - label: "HVF real builds 4 off"
+  - label: "${BENCH_BACKEND:-HVF} real builds 4 off"
     key: hvf-4
     command: python3 /bench/job.py
     agents: *benchmark
     timeout_in_minutes: 45
-  - label: "HVF real builds 5 on"
+  - label: "${BENCH_BACKEND:-HVF} real builds 5 on"
     key: hvf-5
     command: python3 /bench/job.py
     agents: *benchmark
