@@ -1,226 +1,37 @@
 env:
-  # Docker Hub allows 100 anonymous manifest requests per hour per IP, and the
-  # agents share egress IPs. Pull docker.io images through Google's mirror.
-  SPOREVM_DOCKER_HUB_MIRROR: "mirror.gcr.io"
-
+  # Temporary measurement branch; not a change to the release pipeline.
+  BUILDKITE_SKIP_CHECKOUT: "true"
+  BUILDKITE_BUILD_CHECKOUT_PATH: /bench
 steps:
-  - group: ":test_tube: Tests"
-    key: "tests"
-    steps:
-      - label: ":zig: Build & Test (Linux)"
-        key: "test-linux"
-        command: "scripts/ci/run.sh scripts/ci/test.sh"
-        plugins: &mise_plugins
-          - mise#e53a95a05d51dd20b1bfcd98fb3f9fe13292812b:
-              version: "2026.5.12"
-        cache: &mise_cache
-          paths:
-            - "~/.local/share/mise"
-            - "~/.cache/mise"
-            - "~/.local/state/mise"
-          size: "20g"
-          name: "mise-cache"
-        agents: &linux_agents
-          queue: sporevm-linux-arm64
-
-      - label: ":zig: Build & Test (macOS)"
-        key: "test-macos"
-        command: "scripts/ci/run.sh scripts/ci/test.sh"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        concurrency: 1
-        concurrency_group: "sporevm/macos"
-        agents: &mac_agents
-          queue: sporevm-mac
-
-      - label: ":fire: Smoke core (Linux ARM64 KVM)"
-        key: "smoke-core-linux-arm64"
-        command: "scripts/ci/run.sh mise run smoke core"
-        artifact_paths: &smoke_artifacts
-          - "zig-cache/smoke/**/*"
-        timeout_in_minutes: 20
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":fire: Smoke core (macOS ARM64 HVF)"
-        key: "smoke-core-macos"
-        command: "scripts/ci/run.sh mise run smoke core"
-        artifact_paths: *smoke_artifacts
-        timeout_in_minutes: 20
-        plugins: *mise_plugins
-        cache: *mise_cache
-        concurrency: 1
-        concurrency_group: "sporevm/macos"
-        agents: *mac_agents
-
-      - label: ":computer: x86-64 run smoke (Linux AMD64)"
-        key: "x86-run-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke x86/run"
-        artifact_paths: *smoke_artifacts
-        timeout_in_minutes: 30
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents:
-          queue: sporevm-linux-amd64
-
-      - label: ":hammer_and_wrench: x86-64 build smoke (Linux AMD64)"
-        key: "x86-build-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke x86/build"
-        artifact_paths: *smoke_artifacts
-        timeout_in_minutes: 30
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents:
-          queue: sporevm-linux-amd64
-
-      - label: ":microscope: Image worker conformance (Linux ARM64)"
-        key: "image-worker-conformance-linux-arm64"
-        command: "scripts/ci/run.sh scripts/ci/image-worker-conformance.sh linux/arm64"
-        artifact_paths:
-          - "zig-cache/image-worker-conformance/**/*"
-        timeout_in_minutes: 15
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":microscope: Image worker conformance (Linux AMD64)"
-        key: "image-worker-conformance-linux-amd64"
-        command: "scripts/ci/run.sh scripts/ci/image-worker-conformance.sh linux/amd64"
-        artifact_paths:
-          - "zig-cache/image-worker-conformance/**/*"
-        timeout_in_minutes: 15
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents:
-          queue: sporevm-linux-amd64
-
-  - group: ":docker: Spore build"
-    key: "spore-build"
-    steps:
-      - label: ":docker: Conformance (Linux ARM64)"
-        key: "spore-build-conformance-linux-arm64"
-        command: "scripts/ci/run.sh scripts/ci/spore-build-conformance.sh"
-        artifact_paths:
-          - "zig-cache/spore-build-conformance/*.release-build.log"
-          - "zig-cache/spore-build-conformance/*.buildx-install.log"
-          - "zig-cache/spore-build-conformance/*/logs/*"
-          - "zig-cache/spore-build-conformance/*/cases/**/*.command"
-          - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"
-          - "zig-cache/spore-build-conformance/*/cases/**/*.stderr"
-          - "zig-cache/spore-build-conformance/*/cases/**/docker-filesystem.json"
-          - "zig-cache/spore-build-conformance/*/cases/**/spore-filesystem.json"
-          - "zig-cache/spore-build-conformance/*/cases/**/docker-config.json"
-          - "zig-cache/spore-build-conformance/*/cases/**/spore-config.json"
-          - "zig-cache/spore-build-conformance/*/cases/**/*.diff"
-        timeout_in_minutes: 30
-        parallelism: 4
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":fire: RUN executor smoke (Linux ARM64)"
-        key: "spore-build-run-smoke-linux-arm64"
-        command: "scripts/ci/run.sh scripts/ci/spore-build-smoke.sh"
-        artifact_paths:
-          - "zig-cache/spore-build-run-smoke/*/smoke.log"
-        timeout_in_minutes: 15
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-  - group: ":package: Native image distribution"
-    key: "native-image-distribution"
-    steps:
-      - label: ":package: Publish native image archive (Linux ARM64)"
-        key: "native-image-archive-publish-linux-arm64"
-        depends_on: "spore-build-conformance-linux-arm64"
-        command: "scripts/ci/run.sh scripts/ci/native-image-archive-publish.sh"
-        artifact_paths:
-          - "zig-cache/native-image-distribution/ci-final-image.tar.gz"
-          - "zig-cache/native-image-distribution/receipt.env"
-        timeout_in_minutes: 15
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":fire: Consume native image archive (clean Linux ARM64 worker)"
-        key: "native-image-archive-consume-linux-arm64"
-        depends_on: "native-image-archive-publish-linux-arm64"
-        command: "scripts/ci/run.sh scripts/ci/native-image-archive-consume.sh"
-        timeout_in_minutes: 15
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-  - group: ":microscope: Opt-in validation"
-    key: "opt-in-validation"
-    steps:
-      - label: ":ext4: Slow rootfs tests (Linux ARM64)"
-        key: "rootfs-slow-test-linux"
-        if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"
-        command: "scripts/ci/run.sh zig build rootfs-slow-test --summary all"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":package: Diskless saved-spore removal (Linux ARM64)"
-        key: "diskless-remove-packaged-linux-arm64"
-        if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
-        command: "scripts/ci/run.sh scripts/ci/diskless-remove-packaged-smoke.sh"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":package: Diskless saved-spore removal (macOS ARM64)"
-        key: "diskless-remove-packaged-macos-arm64"
-        if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
-        command: "scripts/ci/run.sh scripts/ci/diskless-remove-packaged-smoke.sh"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        concurrency: 1
-        concurrency_group: "sporevm/macos"
-        agents: *mac_agents
-
-  - group: ":package: Release assets"
-    key: "release-assets"
-    steps:
-      - label: ":linux: Linux ARM64 archive"
-        key: "release-linux-arm64"
-        if: build.tag != null
-        command: "scripts/ci/run.sh scripts/release/build-assets.sh --target linux-arm64 --output dist"
-        artifact_paths:
-          - "dist/spore_Linux_arm64.tar.gz"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":mac: macOS ARM64 archive"
-        key: "release-darwin-arm64"
-        if: build.tag != null
-        command: "scripts/ci/run.sh scripts/release/build-assets.sh --target darwin-arm64 --output dist"
-        artifact_paths:
-          - "dist/spore_Darwin_arm64.tar.gz"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        concurrency: 1
-        concurrency_group: "sporevm/macos"
-        agents: *mac_agents
-
-  - wait
-
-  - label: ":rocket: Publish release"
-    key: "release-publish"
-    depends_on:
-      - "test-linux"
-      - "test-macos"
-      - "smoke-core-linux-arm64"
-      - "smoke-core-macos"
-      - "release-linux-arm64"
-      - "release-darwin-arm64"
-    if: build.tag != null
-    command: "scripts/ci/run.sh scripts/ci/buildkite-release.sh"
-    plugins: *mise_plugins
-    cache: *mise_cache
-    agents:
-      queue: hosted
+  - label: "HVF real builds 0 off"
+    key: hvf-0
+    command: python3 /bench/job.py
+    agents: &benchmark
+      queue: sporevm-linux-arm64
+      benchmark: free-page-real-builds-t01a1f6
+    timeout_in_minutes: 45
+  - label: "HVF real builds 1 on"
+    key: hvf-1
+    command: python3 /bench/job.py
+    agents: *benchmark
+    timeout_in_minutes: 45
+  - label: "HVF real builds 2 on"
+    key: hvf-2
+    command: python3 /bench/job.py
+    agents: *benchmark
+    timeout_in_minutes: 45
+  - label: "HVF real builds 3 off"
+    key: hvf-3
+    command: python3 /bench/job.py
+    agents: *benchmark
+    timeout_in_minutes: 45
+  - label: "HVF real builds 4 off"
+    key: hvf-4
+    command: python3 /bench/job.py
+    agents: *benchmark
+    timeout_in_minutes: 45
+  - label: "HVF real builds 5 on"
+    key: hvf-5
+    command: python3 /bench/job.py
+    agents: *benchmark
+    timeout_in_minutes: 45
