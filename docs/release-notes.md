@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v0.20.0
+
+- `spore run --free-page-reporting` and
+  `spore vm create NAME --free-page-reporting` opt into passive free-page
+  return on AArch64 HVF and KVM. The API and create-options JSON expose
+  `free_page_reporting`, default false. Guest memory capacity and vCPU count
+  stay unchanged; this is not balloon inflation or automatic shrinking.
+- Only complete 2 MiB-aligned free buddy ranges are returned. Fragmented free
+  pages and useful page cache are not forced out. Children replace only their
+  private mappings, leaving shared parent backing unchanged. Returned pages
+  fault back in when reused, so measure workload throughput before enabling
+  reporting broadly. See [the memory contract](memory.md#passive-free-page-return).
+- In five-cycle Apple Silicon HVF trials with a 512 MiB VM and a 256 MiB
+  allocation, reporting returned 248–252 MiB. Post-free process RSS was about
+  315 MiB without reporting and 64–67 MiB with it; synthetic allocation/re-touch
+  throughput was 5.3–6.0% lower. Nonzero logical checkpoint RAM fell from
+  294 MiB to 46 MiB. These are not real-build throughput or fleet-density results.
+
+### Upgrading
+
+- Reporting is off by default. Existing checkpoints keep their saved device
+  layout and are not retrofitted. Checkpoints created with reporting need a
+  reporting-capable reader (v0.20.0 or newer); older releases reject the extra
+  device. Restore infers attachment from the checkpoint, so omit the opt-in
+  flag on restore. Checkpoint format remains v8.
+- The managed kernel remains v0.7.4, which already includes the required
+  balloon and page-reporting drivers. The experimental AMD64 profile does
+  not support this option.
+
 ## v0.19.1
 
 - `spore image push` and `spore checkpoint push` to S3 list the objects the
