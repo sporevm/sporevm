@@ -83,7 +83,9 @@ Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
 - The transport clears `FEATURES_OK` unless the accepted features are a subset
   of those offered, and validates restored feature state.
 - Free-page reports use the bounded virtqueue parser and validate the entire
-  copied chain as device-writable before any discard. Only full 2 MiB-aligned
+  copied chain as device-writable and inside the actually guest-mapped RAM
+  prefix before any discard. Reserved, unmapped hotplug tails invalidate the
+  whole report, which is acknowledged without reclaim. Only full 2 MiB-aligned
   subranges are replaced, with all vCPUs parked, disk workers drained and any
   dirty sealer locked. Replacements are anonymous private zero RAM, never
   writes or hole punches into shared backing. Used-ring acknowledgement ends

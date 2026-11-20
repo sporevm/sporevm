@@ -157,6 +157,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         .devices = &devices,
         .ram = ram,
         .config = config,
+        .hotplug = if (hotplug) |*region| region else null,
         .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
     };
     defer threaded.deinit(allocator);

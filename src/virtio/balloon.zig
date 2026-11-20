@@ -51,9 +51,11 @@ pub const Balloon = struct {
 
     /// Caller holds the device lock with vCPUs and disk workers parked.
     /// reclaim(ctx, gpa, len) must replace the range with private zero RAM,
-    /// and synchronize with any background checkpoint sealer.
-    pub fn process(self: *Balloon, transport: *mmio.Transport, ram: guestmem.GuestRam, ctx: anytype, comptime reclaim: anytype) !bool {
+    /// and synchronize with any background checkpoint sealer. mapped_size
+    /// excludes reserved hotplug RAM not yet mapped into the guest.
+    pub fn process(self: *Balloon, transport: *mmio.Transport, ram: guestmem.GuestRam, mapped_size: u64, ctx: anytype, comptime reclaim: anytype) !bool {
         if (!self.hasPending(transport, ram)) return false;
+        const mapped_ram = guestmem.GuestRam{ .bytes = ram.bytes[0..@intCast(mapped_size)], .base = ram.base };
         const q = &transport.queues[reporting_queue];
         var budget: queue.NotifyBudget = .{};
         var completed = false;
@@ -65,6 +67,10 @@ pub const Balloon = struct {
             var valid = true;
             for (chain.segments.slice()) |seg| {
                 if (!seg.writable) valid = false;
+                _ = mapped_ram.slice(seg.addr, seg.data.len) catch {
+                    valid = false;
+                    continue;
+                };
             }
             if (valid) for (chain.segments.slice()) |seg| {
                 if (seg.data.len < reclaim_alignment) continue;
@@ -118,14 +124,14 @@ test "reports return only complete aligned pages and expire at acknowledgement" 
     try testQueue(&transport, ram, reclaim_alignment - 4096, 2 * reclaim_alignment + 8192, 2);
     try std.testing.expect(!(transport.write(0x050, reporting_queue, ram)));
     try std.testing.expectEqual(@as(u8, 0xa7), bytes[reclaim_alignment]);
-    try std.testing.expect(try device.process(&transport, ram, &returned, TestReturn.reclaim));
+    try std.testing.expect(try device.process(&transport, ram, ram.bytes.len, &returned, TestReturn.reclaim));
     try std.testing.expectEqual(@as(u64, 2 * reclaim_alignment), returned.bytes);
     try std.testing.expect(std.mem.allEqual(u8, bytes[reclaim_alignment .. 3 * reclaim_alignment], 0));
     try std.testing.expectEqual(@as(u8, 0xa7), bytes[reclaim_alignment - 1]);
     try std.testing.expectEqual(@as(u8, 0xa7), bytes[3 * reclaim_alignment]);
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, 0x802));
     bytes[reclaim_alignment] = 0x51;
-    try std.testing.expect(!try device.process(&transport, ram, &returned, TestReturn.reclaim));
+    try std.testing.expect(!try device.process(&transport, ram, ram.bytes.len, &returned, TestReturn.reclaim));
     try std.testing.expectEqual(@as(u8, 0x51), bytes[reclaim_alignment]);
     _ = transport.write(0x070, 0, ram);
     try std.testing.expect(!device.reporting);
@@ -143,14 +149,45 @@ test "mixed direction and malformed trailing descriptors cannot partially reclai
     try ram.write(u64, 16, reclaim_alignment);
     try ram.write(u32, 24, 4096);
     try ram.write(u16, 28, 0); // readable tail invalidates the entire chain
-    _ = try device.process(&transport, ram, &returned, TestReturn.reclaim);
+    _ = try device.process(&transport, ram, ram.bytes.len, &returned, TestReturn.reclaim);
     try std.testing.expectEqual(@as(u64, 0), returned.bytes);
     try std.testing.expect(std.mem.allEqual(u8, bytes[reclaim_alignment..], 0x6b));
     try testQueue(&transport, ram, reclaim_alignment, reclaim_alignment, 3);
     try ram.write(u64, 16, std.math.maxInt(u64));
     try ram.write(u16, 28, 2); // out-of-bounds tail fails parsing
-    _ = try device.process(&transport, ram, &returned, TestReturn.reclaim);
+    _ = try device.process(&transport, ram, ram.bytes.len, &returned, TestReturn.reclaim);
     try std.testing.expectEqual(@as(u64, 0), returned.bytes);
+}
+
+test "unmapped elastic tails invalidate whole reports but are acknowledged" {
+    const bytes = try std.testing.allocator.alloc(u8, 4 * reclaim_alignment);
+    defer std.testing.allocator.free(bytes);
+    const ram = guestmem.GuestRam{ .bytes = bytes, .base = 0 };
+    const Case = struct { start: u64, size: u32, mapped: u64, returned: u64, mixed: bool = false };
+    const cases = [_]Case{
+        .{ .start = 2 * reclaim_alignment, .size = reclaim_alignment, .mapped = 2 * reclaim_alignment, .returned = 0 },
+        .{ .start = 2 * reclaim_alignment, .size = reclaim_alignment, .mapped = 3 * reclaim_alignment, .returned = reclaim_alignment },
+        .{ .start = 3 * reclaim_alignment, .size = reclaim_alignment, .mapped = 3 * reclaim_alignment, .returned = 0 },
+        .{ .start = 2 * reclaim_alignment, .size = 2 * reclaim_alignment, .mapped = 3 * reclaim_alignment, .returned = 0 },
+        .{ .start = reclaim_alignment, .size = reclaim_alignment, .mapped = 3 * reclaim_alignment, .returned = 0, .mixed = true },
+    };
+    for (cases) |case| {
+        @memset(bytes, 0x6b);
+        var device: Balloon = .{};
+        var transport = mmio.Transport.init(device.device());
+        var returned = TestReturn{ .ram = ram };
+        try testQueue(&transport, ram, case.start, case.size, if (case.mixed) 3 else 2);
+        if (case.mixed) {
+            try ram.write(u64, 16, 3 * reclaim_alignment);
+            try ram.write(u32, 24, reclaim_alignment);
+            try ram.write(u16, 28, 2);
+        }
+        try std.testing.expect(try device.process(&transport, ram, case.mapped, &returned, TestReturn.reclaim));
+        try std.testing.expectEqual(case.returned, returned.bytes);
+        try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, 0x802));
+        try std.testing.expect(!device.hasPending(&transport, ram));
+        if (case.returned == 0) try std.testing.expect(std.mem.allEqual(u8, bytes[reclaim_alignment..], 0x6b));
+    }
 }
 
 fn fuzzReports(_: void, smith: *std.testing.Smith) !void {
@@ -167,6 +204,7 @@ fn fuzzReports(_: void, smith: *std.testing.Smith) !void {
     // fuzzing exercises successful reclaim as well as parser rejection.
     const start = if (smith.value(bool)) addr % reclaim_alignment + reclaim_alignment else addr;
     const size: u32 = if (smith.value(bool)) @intCast(len % (2 * reclaim_alignment) + reclaim_alignment) else len;
+    const mapped_size = @as(u64, smith.value(u8) % 5) * reclaim_alignment;
     try testQueue(&transport, ram, start, size, flags);
     const Probe = struct {
         start: u64,
@@ -181,11 +219,11 @@ fn fuzzReports(_: void, smith: *std.testing.Smith) !void {
         }
     };
     var probe = Probe{ .start = start, .size = size, .flags = flags };
-    _ = try device.process(&transport, ram, &probe, Probe.reclaim);
+    _ = try device.process(&transport, ram, mapped_size, &probe, Probe.reclaim);
     // Independent oracle: enumerate RAM blocks, rather than duplicating
     // the implementation's inward-rounding calculation.
     var expected: u64 = 0;
-    if (start < bytes.len and size <= bytes.len - start and flags & 6 == 2) {
+    if (start < mapped_size and size <= mapped_size - start and flags & 6 == 2) {
         for (0..4) |block| {
             const gpa = block * reclaim_alignment;
             if (start <= gpa and size >= reclaim_alignment and gpa - start <= size - reclaim_alignment) expected += reclaim_alignment;
@@ -195,9 +233,11 @@ fn fuzzReports(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz free-page reports" {
-    const aligned = std.mem.toBytes([_]u64{ reclaim_alignment, reclaim_alignment, 2, 0, 0 });
-    const unaligned = std.mem.toBytes([_]u64{ reclaim_alignment - 4096, 2 * reclaim_alignment + 8192, 2, 0, 0 });
-    const overflow = std.mem.toBytes([_]u64{ std.math.maxInt(u64), std.math.maxInt(u32), 2, 0, 0 });
-    const indirect = std.mem.toBytes([_]u64{ reclaim_alignment, reclaim_alignment, 6, 0, 0 });
-    try std.testing.fuzz({}, fuzzReports, .{ .corpus = &.{ &aligned, &unaligned, &overflow, &indirect } });
+    const aligned = std.mem.toBytes([_]u64{ reclaim_alignment, reclaim_alignment, 2, 0, 0, 4 });
+    const unaligned = std.mem.toBytes([_]u64{ reclaim_alignment - 4096, 2 * reclaim_alignment + 8192, 2, 0, 0, 4 });
+    const overflow = std.mem.toBytes([_]u64{ std.math.maxInt(u64), std.math.maxInt(u32), 2, 0, 0, 4 });
+    const indirect = std.mem.toBytes([_]u64{ reclaim_alignment, reclaim_alignment, 6, 0, 0, 4 });
+    const unmapped = std.mem.toBytes([_]u64{ 2 * reclaim_alignment, reclaim_alignment, 2, 0, 0, 2 });
+    const boundary = std.mem.toBytes([_]u64{ 2 * reclaim_alignment, reclaim_alignment, 2, 0, 0, 3 });
+    try std.testing.fuzz({}, fuzzReports, .{ .corpus = &.{ &aligned, &unaligned, &overflow, &indirect, &unmapped, &boundary } });
 }

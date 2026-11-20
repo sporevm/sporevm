@@ -135,7 +135,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const vcpus = try allocator.alloc(Vcpu, prepared.vcpus);
     defer allocator.free(vcpus);
     for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .io = config.io, .index = @intCast(index) };
-    var threaded: Threaded = .{ .vm = &vm, .vcpus = vcpus, .devices = &devices, .ram = ram, .config = config };
+    var threaded: Threaded = .{ .vm = &vm, .vcpus = vcpus, .devices = &devices, .ram = ram, .config = config, .hotplug = if (hotplug) |*region| region else null };
     defer threaded.deinit(allocator);
     try threaded.start(allocator);
 

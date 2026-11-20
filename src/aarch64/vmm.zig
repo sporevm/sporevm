@@ -1188,6 +1188,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         devices: *Devices,
         ram: guestmem.GuestRam,
         config: *const Config,
+        hotplug: ?*const Hotplug(Vm) = null,
         dirty_tracker: ?*Tracker = null,
         slots: []Slot = &.{},
         /// What each vCPU captured, or will apply, at a pause.
@@ -1772,7 +1773,13 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             errdefer |err| self.finish(.{ .err = err });
             self.device_lock.lockUncancelable(self.config.io);
             defer self.device_lock.unlock(self.config.io);
-            if (try self.devices.balloon.process(&self.devices.transports()[index], self.ram, self, reclaimReportedRange)) {
+            // Requested size can lead actual mapping until the guest plugs
+            // a block. Read the mapper's committed prefix while parked.
+            const mapped_size = if (self.hotplug) |region|
+                region.guest_addr - self.ram.base + region.mapped_bytes
+            else
+                self.ram.bytes.len;
+            if (try self.devices.balloon.process(&self.devices.transports()[index], self.ram, mapped_size, self, reclaimReportedRange)) {
                 try self.vm.setSpi(board.virtioDeviceIntid(@intCast(index)), true);
             }
         }
@@ -2996,6 +3003,48 @@ test "threaded run grows virtio-mem when the probe reports memory pressure" {
     try threaded.start(allocator);
     try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, testRunSource(&config, &devices, &.{})));
     try std.testing.expectEqual(virtio_mem.requestedSizeAfterPressure(0, region_size, 2), devices.mem.requested_size);
+}
+
+test "threaded reporting uses committed hotplug mappings not requested size" {
+    const allocator = std.testing.allocator;
+    const mapping = try mapAnonymousRam(4 * spore.chunk_size);
+    defer mapping.deinit();
+    @memset(mapping.bytes, 0x68);
+    const ram = guestmem.GuestRam{ .bytes = mapping.bytes, .base = board.ram_base };
+    var config = testBoot(.{});
+    config.free_page_reporting = true;
+    var vm: ThreadTestVm = .{};
+    var hotplug = Hotplug(ThreadTestVm){ .vm = &vm, .bytes = @alignCast(mapping.bytes[2 * spore.chunk_size ..]), .guest_addr = ram.base + 2 * spore.chunk_size };
+    var devices: Devices = undefined;
+    // A growth request is outstanding, but the guest has not plugged yet.
+    devices.init(&config, .{ .addr = hotplug.guest_addr, .region_size = hotplug.bytes.len, .requested_size = hotplug.bytes.len });
+    defer devices.net.shutdown();
+    const transport = &devices.transports()[devices.balloon_index.?];
+    try transport.applyRestoredFeatureState(mmio.status_driver_ok | mmio.status_features_ok, mmio.f_version_1 | balloon.feature_reporting);
+    transport.queues[balloon.reporting_queue] = .{ .size = 8, .ready = true, .desc_addr = ram.base, .avail_addr = ram.base + 0x400, .used_addr = ram.base + 0x800 };
+    try ram.write(u64, ram.base, hotplug.guest_addr);
+    try ram.write(u32, ram.base + 8, spore.chunk_size);
+    try ram.write(u16, ram.base + 12, 2);
+    var vcpus = [_]ThreadTestVcpu{.{ .index = 0, .live = undefined }};
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = ram,
+        .config = &config,
+        .hotplug = &hotplug,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+    for (0..2) |pass| {
+        try ram.write(u16, ram.base + 0x404 + 2 * pass, 0);
+        try ram.write(u16, ram.base + 0x402, @intCast(pass + 1));
+        try threaded.returnFreePages();
+        try std.testing.expectEqual(@as(u16, @intCast(pass + 1)), try ram.read(u16, ram.base + 0x802));
+        try std.testing.expect(std.mem.allEqual(u8, mapping.bytes[2 * spore.chunk_size .. 3 * spore.chunk_size], if (pass == 0) 0x68 else 0));
+        // Once mapping is committed, the same range becomes reportable.
+        hotplug.mapped_bytes = spore.chunk_size;
+    }
 }
 
 test "threaded capture request can keep the guest running" {

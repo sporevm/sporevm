@@ -70,9 +70,12 @@ uses it again: measure workload throughput, not just idle RSS, before enabling
 this option broadly.
 
 Only complete 2 MiB-aligned ranges inside a report are returned. Host RAM bases
-are also 2 MiB aligned. Partial ends stay intact, avoiding splits of live huge
-pages. KVM advises replacement ranges as THP-eligible; this is best effort, not
-a guarantee of huge-page allocation. Returning a huge page necessarily releases
+are also 2 MiB aligned. Every segment must lie within actually mapped guest
+RAM; a report touching an unmapped hotplug tail is ignored and acknowledged as
+a whole. Requested growth alone does not make a range reportable. Partial
+ends stay intact, avoiding splits of live huge pages. KVM advises replacement
+ranges as THP-eligible; this is best effort, not a guarantee of huge-page
+allocation. Returning a huge page necessarily releases
 that page; a later touch may allocate another one. This does not add hugetlb
 support or change sharing/COW costs for live parent pages.
 
