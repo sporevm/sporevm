@@ -51,7 +51,7 @@ Not goals:
 - **Caller paths are validated** before a helper spawns or a socket binds;
   for example, against the 104-byte macOS `sun_path` limit.
 - **The device model is frozen**: virtio-mmio console, blk, net, vsock, rng,
-  mem, and the generation device. An addition updates
+  mem, opt-in reporting-only balloon, and the generation device. An addition updates
   `docs/spore-format.md`, this file, and the relevant design doc.
 - **New parsers come with fuzz tests** in the same change. `zig build test` runs
   every fuzz test over its seed corpus (CI does this on every commit);
@@ -82,6 +82,18 @@ Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
   pause proceeds.
 - The transport clears `FEATURES_OK` unless the accepted features are a subset
   of those offered, and validates restored feature state.
+- Free-page reports use the bounded virtqueue parser and validate the entire
+  copied chain as device-writable and inside the actually guest-mapped RAM
+  prefix before any discard. Reserved, unmapped hotplug tails invalidate the
+  whole report, which is acknowledged without reclaim. Only full 2 MiB-aligned
+  subranges are replaced. Each pause consumes at most one chain; its aligned
+  ranges are coalesced so at most 64 mapping replacements cover at most the
+  mapped guest RAM size in unique bytes. Excess chains remain pending.
+  Replacements run with all vCPUs parked, disk workers drained and any dirty
+  sealer locked. They are anonymous private zero RAM, never
+  writes or hole punches into shared backing. Used-ring acknowledgement ends
+  ownership immediately; no completed-report address is retained for later
+  discard. Balloon inflation, page poisoning, hints and stats are not offered.
 - `WRITE_ZEROES` is offered only during rootfs growth. A request must be exactly
   a 16-byte header, one range of at most 4 MiB, and a status byte, with only
   `UNMAP`, and is fully validated before any mutation. Full-machine capture
@@ -103,7 +115,7 @@ Fuzz tests: `fuzz virtqueue parsing`, `fuzz mmio register interface`,
 `fuzz block request handling`, `fuzz write zeroes state transitions`,
 `fuzz console queue handling`, `fuzz net tx handling`, `fuzz net rx delivery`,
 `fuzz vsock tx handling`, `fuzz vsock rx delivery splitting`,
-`fuzz rng queue handling`, `fuzz virtio-mem queue handling`,
+`fuzz rng queue handling`, `fuzz virtio-mem queue handling`, `fuzz free-page reports`,
 `fuzz generation mmio`, `fuzz multi-vCPU GICv3 validation`,
 `fuzz KVM_EXIT_IO envelope decoder`, `fuzz finite x86 PIO policy`,
 `fuzz x86 KVM MMIO exit router`,

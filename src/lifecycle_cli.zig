@@ -92,6 +92,7 @@ pub const create_usage =
     \\  --annotation KEY=VALUE  Add a create-time annotation to saved manifests
     \\  --memory SIZE           Initial guest memory (default: 512mb)
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
+    \\  --free-page-reporting   Return reported free pages to the host (aarch64)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --startup-timeout DURATION  Monitor/guest readiness limit (default: 30s)
@@ -245,6 +246,7 @@ const CreateOptionsFile = struct {
     pull: ?[]const u8 = null,
     memory: ?[]const u8 = null,
     max_memory: ?[]const u8 = null,
+    free_page_reporting: bool = false,
     vcpus: ?topology.VcpuCount = null,
     guest_port: ?u32 = null,
     startup_timeout_ms: ?u64 = null,
@@ -354,6 +356,7 @@ pub fn createCli(ctx: *const Ctx, args: []const []const u8) !void {
         .initial_command = caller_command,
         .network = parsed.network,
         .memory = spec.memory,
+        .free_page_reporting = spec.free_page_reporting,
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
         .startup_timeout_ms = spec.startup_timeout_ms,
@@ -1214,6 +1217,7 @@ fn parseCreateOptionsFile(
         out.spec.memory.maximum_bytes = try memory_config.parseBytes(maximum);
     }
     try out.spec.memory.validate();
+    out.spec.free_page_reporting = file.free_page_reporting;
     if (file.vcpus) |vcpus| out.spec.vcpus = vcpus;
     if (file.guest_port) |port| out.spec.guest_port = port;
     if (file.startup_timeout_ms) |timeout| {
@@ -1383,6 +1387,9 @@ fn parseCreateArgs(
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
             max_memory_set = true;
+        } else if (std.mem.eql(u8, args[i], "--free-page-reporting")) {
+            field_flag_seen = true;
+            spec.free_page_reporting = true;
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             const message = "spore vm create: --memory-mib has been replaced by --memory";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -2305,6 +2312,9 @@ test "create parser separates initial and maximum memory" {
     const default_opts = try parseCreateArgs(&.{"bench-1"}, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(memory_config.default_bytes, default_opts.spec.memory.initial_bytes);
     try std.testing.expectEqual(memory_config.default_bytes, default_opts.spec.memory.maximum_bytes);
+    try std.testing.expect(!default_opts.spec.free_page_reporting);
+    const reporting = try parseCreateArgs(&.{ "bench-1", "--free-page-reporting" }, allocator, &stderr.writer, .human);
+    try std.testing.expect(reporting.spec.free_page_reporting);
 
     const fixed_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "2gb" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed_opts.spec.memory.initial_bytes);
@@ -2507,6 +2517,7 @@ test "create options file maps to create options" {
         \\  "schema_version": 1,
         \\  "image": "docker.io/library/alpine:3.20",
         \\  "memory": "512mb",
+        \\  "free_page_reporting": true,
         \\  "vcpus": 2,
         \\  "timeout_ms": 120000,
         \\  "network": {
@@ -2523,6 +2534,7 @@ test "create options file maps to create options" {
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.spec.image_ref.?);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), opts.spec.memory.initial_bytes);
     try std.testing.expectEqual(opts.spec.memory.initial_bytes, opts.spec.memory.maximum_bytes);
+    try std.testing.expect(opts.spec.free_page_reporting);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
     try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
     const policy = &opts.network.spore;

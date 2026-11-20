@@ -61,6 +61,7 @@ pub const Request = struct {
     interactive: bool = false,
     tty: bool = false,
     memory: memory_config.Config = .{},
+    free_page_reporting: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     startup_timeout_ms: u64 = 30_000,
@@ -153,6 +154,7 @@ pub const SharedOptions = struct {
     memory: memory_config.Config = .{},
     memory_set: bool = false,
     max_memory_set: bool = false,
+    free_page_reporting: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     startup_timeout_ms: u64 = 30_000,
@@ -222,6 +224,7 @@ pub const cli_usage =
     \\  --continue-after-save   Keep running after a signal-triggered save
     \\  --memory SIZE           Initial guest memory (default: 512mb)
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
+    \\  --free-page-reporting   Return reported free pages to the host (aarch64)
     \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --startup-timeout DURATION  Guest readiness limit (default: 30s)
@@ -478,6 +481,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         if (shared.memory_set or shared.max_memory_set) {
             failCliSetup("spore run: --checkpoint uses the spore manifest memory sizes; omit --memory and --max-memory", .{});
         }
+        if (shared.free_page_reporting) failCliSetup("spore run: --checkpoint restores free-page reporting from its manifest; omit --free-page-reporting", .{});
     } else {
         if (generation_path != null) {
             failCliSetup("spore run: --generation requires --checkpoint", .{});
@@ -901,6 +905,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, request: Re
     const cause = vm_session.run(context, allocator, .{
         .backend = backend,
         .machine = machine,
+        .free_page_reporting = request.free_page_reporting,
         .vcpus = request.vcpus,
         .disks = disks,
         .network = .{ .runtime = network, .manifest = network_manifest },
@@ -1209,6 +1214,8 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--max-memory")) {
         shared.memory.maximum_bytes = parseMemoryBytes(name, takeValue(args, i, name));
         shared.max_memory_set = true;
+    } else if (std.mem.eql(u8, name, "--free-page-reporting")) {
+        shared.free_page_reporting = true;
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
         failCliSetup("spore run: --memory-mib has been replaced by --memory", .{});
     } else if (std.mem.eql(u8, name, "--vcpus")) {
@@ -1676,6 +1683,9 @@ test "run cli parser defaults to fixed 512MiB" {
     try std.testing.expect(opts.shared.initrd_path == null);
     try std.testing.expectEqual(memory_config.default_bytes, opts.shared.memory.initial_bytes);
     try std.testing.expectEqual(memory_config.default_bytes, opts.shared.memory.maximum_bytes);
+    try std.testing.expect(!opts.shared.free_page_reporting);
+    const reporting = try parseCliArgs(std.testing.allocator, &.{ "--free-page-reporting", "--", "/bin/true" });
+    try std.testing.expect(reporting.shared.free_page_reporting);
     try std.testing.expectEqual(cli_args.CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);

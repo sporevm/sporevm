@@ -176,6 +176,7 @@ fn runParsed(
         .interactive = parsed.interactive,
         .tty = parsed.tty,
         .memory = parsed.shared.memory,
+        .free_page_reporting = parsed.shared.free_page_reporting,
         .vcpus = parsed.shared.vcpus,
         .guest_port = parsed.shared.guest_port,
         .startup_timeout_ms = parsed.shared.startup_timeout_ms,

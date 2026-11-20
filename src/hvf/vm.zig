@@ -135,7 +135,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const vcpus = try allocator.alloc(Vcpu, prepared.vcpus);
     defer allocator.free(vcpus);
     for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .io = config.io, .index = @intCast(index) };
-    var threaded: Threaded = .{ .vm = &vm, .vcpus = vcpus, .devices = &devices, .ram = ram, .config = config };
+    var threaded: Threaded = .{ .vm = &vm, .vcpus = vcpus, .devices = &devices, .ram = ram, .config = config, .hotplug = if (hotplug) |*region| region else null };
     defer threaded.deinit(allocator);
     try threaded.start(allocator);
 
@@ -384,6 +384,21 @@ const Vm = struct {
 
     pub fn unmapHotplug(_: *const Vm, guest_addr: u64, mapped_bytes: u64) void {
         _ = hvf.hv_vm_unmap(guest_addr, mapped_bytes);
+    }
+
+    /// Caller has parked all vCPUs, drained disk workers and locked the
+    /// dirty tracker, if any. HVF must release the old physical-page pins.
+    pub fn reclaimRam(self: *const Vm, ram: guestmem.GuestRam, gpa: u64, len: u64) !void {
+        const bytes = try ram.slice(gpa, len);
+        try hvf.check(hvf.hv_vm_unmap(gpa, len), "hv_vm_unmap reported RAM");
+        try vmm.replaceReportedRam(ram, gpa, len);
+        const flags = if (self.dirty_tracker != null) hvf.MemoryFlags.rx else hvf.MemoryFlags.rwx;
+        try hvf.check(hvf.hv_vm_map(bytes.ptr, gpa, len, flags), "hv_vm_map reported RAM");
+        if (self.dirty_tracker) |tracker| {
+            const start: usize = @intCast((gpa - ram.base) / spore.chunk_size);
+            const count: usize = @intCast(len / spore.chunk_size);
+            @memset(tracker.backend.writable_chunks[start..][0..count], false);
+        }
     }
 
     pub fn captureGic(_: *const Vm, arena: std.mem.Allocator, _: usize) !gicv3.State {

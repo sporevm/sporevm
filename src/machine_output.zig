@@ -214,6 +214,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.PathAlreadyExists => CliError.init(.object_invalid, "Destination already exists; choose a new output path.", @errorName(err)),
         error.X86ForkUnsupported => CliError.init(.usage_invalid_argument, "x86-64 KVM checkpoint fork is unavailable; only fresh execution is supported.", @errorName(err)),
         error.X86NamedCopyUnsupported => CliError.init(.usage_invalid_argument, "x86-64 KVM does not support copying files into or out of a named VM.", @errorName(err)),
+        error.FreePageReportingUnsupported => CliError.init(.usage_invalid_argument, "Free-page reporting requires an AArch64 HVF or KVM guest.", @errorName(err)),
         error.MissingImageArchiveOutput,
         error.MissingImageArchive,
         error.MissingImageArchiveDigest,

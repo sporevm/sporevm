@@ -238,6 +238,13 @@ reset or poweroff.
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
   / INTID 56. Elastic manifests attach one grow-only virtio-mem device and
   persist its normalized state; fixed manifests must not contain that device.
+  Opt-in free-page reporting appends a reporting-only virtio-balloon (device
+  id 5) after all other transports. Its three queues are inflate, deflate and
+  reporting (0, 1, 2); stats and hint queues are absent. The target remains
+  zero and only `VIRTIO_BALLOON_F_REPORTING` (bit 5) is offered in addition to
+  transport VERSION_1. Existing version-8 checkpoints without this optional
+  device remain unchanged. Older restorers reject the additional transport
+  rather than silently dropping it; no raw backend reclaim state is saved.
 - `machine`: normalized architectural vCPU and interrupt-controller state, as
   an object with exactly one member: `single` when `platform.vcpu_count` is 1
   and `multi` when it is 2 or more. Both are described below.
