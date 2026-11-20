@@ -25,6 +25,7 @@ def run(label, args, capture=None, events=False, expected_source=None):
     restore_source = None
     capture_timer = None
     transcript = ""
+    sample_until = float("inf")
     with (root / (label + ".stderr")).open("w") as err:
         process = subprocess.Popen([spore, *args], stdout=subprocess.PIPE,
                                    stderr=err, text=True, bufsize=1)
@@ -56,10 +57,13 @@ def run(label, args, capture=None, events=False, expected_source=None):
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
                     print(label + ": " + line, flush=True)
+                    if "memreport verified" in line:
+                        sample_until = min(sample_until, time.monotonic())
                     match = re.search(r"memreport (allocated|freed) cycle=(\d+)", line)
                     if match:
                         phases.append((time.monotonic(), match[1], int(match[2])))
                         if capture == match[1] and match[2] == "0":
+                            sample_until = time.monotonic() + (hold * 0.75 if capture == "freed" else 0)
                             # Let Linux's delayed reporting worker return free
                             # pages before capturing the post-free checkpoint.
                             if capture == "freed":
@@ -87,7 +91,8 @@ def run(label, args, capture=None, events=False, expected_source=None):
         assert restore_source == expected_source, (label, restore_source, expected_source)
     allocated, freed = [], []
     for i, (start, phase, _) in enumerate(phases):
-        end = phases[i + 1][0] if i + 1 < len(phases) else float("inf")
+        # Never count the VMM releasing RAM after workload completion/save.
+        end = min(phases[i + 1][0] if i + 1 < len(phases) else float("inf"), sample_until)
         values = [rss for when, rss in samples if start + 0.5 < when < end]
         if values:
             (allocated if phase == "allocated" else freed).append(min(values))
