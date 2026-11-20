@@ -18,6 +18,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 core=(
   run/basic.sh
   run/capture.sh
+  run/free-page-reporting.sh
   fanout/counter.sh
   fanout/named-disk-fork.sh
   lifecycle/basic.sh

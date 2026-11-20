@@ -42,6 +42,53 @@ The virtio-mem usable region grows with the requested size and never shrinks.
 The guest may plug any non-overlapping blocks inside that usable prefix until
 the requested amount is satisfied.
 
+## Passive free-page return
+
+On AArch64 HVF and KVM, `spore run --free-page-reporting` and
+`spore vm create NAME --free-page-reporting` opt into a reporting-only
+virtio-balloon device. The API option and `vm create --options` JSON field are
+`free_page_reporting` (default false). This works with fixed memory and with
+the existing grow-only profile. It never inflates a balloon, unplugs memory,
+changes guest MemTotal, or changes the configured vCPU count. The guest needs
+`CONFIG_VIRTIO_BALLOON` and `CONFIG_PAGE_REPORTING` (included in managed kernels).
+Guests configured to require page-poison preservation cannot negotiate this
+profile; no page-poison feature is offered.
+
+Linux reports free buddy blocks asynchronously, not every page freed by an
+application. Fragmented free pages and reclaimable page cache are not forced
+out. A returned page incurs fresh host allocation/zeroing faults if the guest
+uses it again: measure workload throughput, not just idle RSS, before enabling
+this option broadly.
+
+Only complete 2 MiB-aligned ranges inside a report are returned. Host RAM bases
+are also 2 MiB aligned. Partial ends stay intact, avoiding splits of live huge
+pages. KVM advises replacement ranges as THP-eligible; this is best effort, not
+a guarantee of huge-page allocation. Returning a huge page necessarily releases
+that page; a later touch may allocate another one. This does not add hugetlb
+support or change sharing/COW costs for live parent pages.
+
+The runner parks every vCPU and drains disk workers before changing backing.
+HVF unmaps the reported GPA, replaces its host mapping with private anonymous
+zero RAM, then remaps it; KVM retains memslot addresses and invalidates old
+translations through the host MMU notifier path. Neither backend punches holes
+in parent backing. `MADV_DONTNEED` alone is insufficient: on private file RAM it
+can expose the parent's old bytes rather than zeroes.
+
+Reported zeroes are host writes for dirty tracking. Mapping replacement is
+serialized with checkpoint sealing, and HVF restores write protection before
+resuming. Transport checkpoints retain negotiation, queue indices, pending
+descriptors and interrupts. Restore infers attachment from the manifest, so
+omit the opt-in flag on restore. Pending reports remain owned by the device
+until acknowledgement; completed reports are never replayed or remembered as
+authority to discard pages again. Fork children reclaim only their private
+mappings; the shared parent and siblings remain unchanged.
+
+`mise run smoke run/free-page-reporting` exercises allocation, free, re-touch,
+single-/multi-vCPU execution, save, fork, local-backing restore, verified-chunk
+restore and parent immutability. It prints host RSS and guest allocation-work
+throughput separately. `SPORE_REPORTING_CYCLES` increases samples. No automatic
+capacity-shrink policy is implemented.
+
 ## Manifest Authority
 
 `manifest.memory` records fixed-size BLAKE3-addressed chunks in the
@@ -174,7 +221,8 @@ before its proof is written.
 - Resume from chunks is portable; local backing is same-host acceleration only.
   Chunk resume writes only non-zero chunks into fresh anonymous RAM, so zero
   chunks stay uncommitted until the guest touches them.
-- Virtio-mem is grow-only. Unplug and reclamation remain unsupported.
+- Virtio-mem is grow-only. Capacity shrink and unplug remain unsupported;
+  opt-in free-page reporting returns backing without changing capacity.
 
 ## Validation
 

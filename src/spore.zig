@@ -36,6 +36,11 @@ pub const ram_backing_proof_path = "ram.backing.proof";
 pub const memory_object_namespace = "memory/blake3";
 pub const virtio_mem_device_id: u32 = 24;
 
+/// The reporting-only balloon is always appended after the other devices.
+pub fn hasFreePageReporting(devices: []const TransportState) bool {
+    return devices.len != 0 and devices[devices.len - 1].device_id == @import("virtio/balloon.zig").device_id;
+}
+
 pub const Error = error{
     BadManifest,
     FormatTooOld,
@@ -1055,8 +1060,11 @@ pub fn validateManifest(manifest: Manifest) Error!void {
     }
     try validateTransportQueues(manifest.devices);
     var virtio_mem_count: usize = 0;
-    for (manifest.devices) |device| {
+    for (manifest.devices, 0..) |device, i| {
         if (device.device_id == virtio_mem_device_id) virtio_mem_count += 1;
+        if (device.device_id == @import("virtio/balloon.zig").device_id) {
+            if (i != manifest.devices.len - 1 or device.queues.len != 3) return error.BadManifest;
+        }
     }
     if (virtio_mem_count != @intFromBool(manifest.memory_state != null)) return error.BadManifest;
     if (manifest.rootfs) |r| {

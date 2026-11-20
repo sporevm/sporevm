@@ -28,6 +28,7 @@ const spore = @import("../spore.zig");
 const test_barrier = @import("../test_barrier.zig");
 const topology = @import("../topology.zig");
 const blk = @import("../virtio/blk.zig");
+const balloon = @import("../virtio/balloon.zig");
 const console = @import("../virtio/console.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const mmio = @import("../virtio/mmio.zig");
@@ -86,6 +87,8 @@ pub const Config = struct {
     /// On restore, 1 means "use the manifest's count"; any other count must
     /// match the manifest.
     vcpus: topology.VcpuCount = 1,
+    /// Passive return of free pages; never changes guest capacity.
+    free_page_reporting: bool = false,
     console_sink: *const fn ([]const u8) void,
     /// Block backend for /dev/vda, if any.
     disk_backend: ?blk.Backend = null,
@@ -276,7 +279,7 @@ pub fn prepare(allocator: std.mem.Allocator, config: Config, rules: Rules) !Prep
     // Console, net, vsock and rng are always present.
     const device_count = @as(usize, 4) + @intFromBool(config.disk_backend != null) + @intFromBool(config.context_disk_fd != null) +
         config.build_input_disk_backends.len + @intFromBool(config.build_cache_disk_backend != null) +
-        @intFromBool(prepared.virtio_mem_region_size != 0);
+        @intFromBool(prepared.virtio_mem_region_size != 0) + @intFromBool(prepared.config.free_page_reporting);
     if (device_count > board.max_virtio_devices) return error.TooManyVirtioDevices;
     return prepared;
 }
@@ -294,6 +297,8 @@ fn loadRestore(allocator: std.mem.Allocator, config: Config, restore: Start.Rest
     const restored_memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state);
     prepared.ram_size = restored_memory.initial_bytes;
     prepared.virtio_mem_region_size = restored_memory.maximum_bytes - restored_memory.initial_bytes;
+    // Attachment is a checkpoint contract, not a restore-time switch.
+    prepared.config.free_page_reporting = spore.hasFreePageReporting(manifest.devices);
     return prepared;
 }
 
@@ -311,12 +316,14 @@ pub const Devices = struct {
     rng: rng.Rng,
     vsock: vsock.Vsock,
     mem: virtio_mem.Mem,
+    balloon: balloon.Balloon,
     gen: generation.Device,
     transports_buf: [board.max_virtio_devices]mmio.Transport,
     transport_count: usize,
     net_index: usize,
     vsock_index: usize,
     mem_index: ?usize,
+    balloon_index: ?usize,
 
     /// Initializes in place because each transport points at its device.
     /// `prepare` has already checked that the devices fit the board.
@@ -354,6 +361,12 @@ pub const Devices = struct {
             self.mem = virtio_mem.Mem.init(mem_config);
             self.mem_index = self.transport_count;
             self.add(self.mem.device());
+        }
+        self.balloon = .{};
+        self.balloon_index = null;
+        if (config.free_page_reporting) {
+            self.balloon_index = self.transport_count;
+            self.add(self.balloon.device());
         }
     }
 
@@ -501,14 +514,21 @@ pub fn mapRam(prepared: *const Prepared) !RamMapping {
 }
 
 fn mapAnonymousRam(size: u64) !RamMapping {
-    const bytes = try std.posix.mmap(
+    // A reported 2 MiB GPA range must also be aligned in the host mapping.
+    // Reserve and trim rather than assuming mmap's page alignment is enough.
+    const reserved = try std.posix.mmap(
         null,
-        @intCast(size),
+        std.math.add(usize, std.math.cast(usize, size) orelse return error.OutOfMemory, balloon.reclaim_alignment) catch return error.OutOfMemory,
         .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
     );
+    const start = std.mem.alignForward(usize, @intFromPtr(reserved.ptr), balloon.reclaim_alignment) - @intFromPtr(reserved.ptr);
+    const end = start + @as(usize, @intCast(size));
+    if (start != 0) std.posix.munmap(reserved[0..start]);
+    std.posix.munmap(@alignCast(reserved[end..]));
+    const bytes = @as([]align(std.heap.page_size_min) u8, @alignCast(reserved[start..end]));
     return .{ .bytes = bytes, .file_backed = false };
 }
 
@@ -516,16 +536,34 @@ fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
     const actual_size = try fileSize(fd);
     if (actual_size != size) return error.BadManifest;
 
+    const reserved = try mapAnonymousRam(size);
+    errdefer reserved.deinit();
     const bytes = try std.posix.mmap(
-        null,
+        reserved.bytes.ptr,
         @intCast(size),
         .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE },
+        .{ .TYPE = .PRIVATE, .FIXED = true },
         fd,
         0,
     );
     std.log.info("mapped RAM from file backing fd: size={d} mode=MAP_PRIVATE", .{size});
     return .{ .bytes = bytes, .file_backed = true };
+}
+
+/// With all RAM users stopped, replace reported pages at the same host
+/// address. Unlike DONTNEED on private file RAM this cannot reveal the old
+/// parent bytes; unlike punching holes it never mutates shared backing.
+pub fn replaceReportedRam(ram: guestmem.GuestRam, gpa: u64, len: u64) !void {
+    const bytes = try ram.slice(gpa, len);
+    std.debug.assert(len != 0 and gpa % balloon.reclaim_alignment == 0 and len % balloon.reclaim_alignment == 0);
+    _ = try std.posix.mmap(
+        @alignCast(bytes.ptr),
+        bytes.len,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+        -1,
+        0,
+    );
 }
 
 fn fileSize(fd: std.c.fd_t) !u64 {
@@ -1530,6 +1568,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             const io = self.config.io;
             const transports = self.devices.transports();
             const vsock_base = board.virtioDeviceBase(@intCast(self.devices.vsock_index));
+            const balloon_base = if (self.devices.balloon_index) |index| board.virtioDeviceBase(@intCast(index)) else 0;
             while (true) {
                 const seen = self.vcpu_events.load(.acquire);
                 if (self.stopped()) return;
@@ -1575,6 +1614,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                         // A vsock write can move the probe or a control's
                         // stream along.
                         if (access.write != null and access.addr -% vsock_base < board.virtio_stride) self.notifyMain();
+                        if (balloon_base != 0 and access.write != null and access.addr -% balloon_base < board.virtio_stride) self.notifyMain();
                     },
                     .wfi => self.waitVcpu(seen),
                     .shutdown => |kind| self.finish(.{ .exit = kind.cause() }),
@@ -1587,6 +1627,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// requests and virtio-mem growth until the run ends.
         pub fn run(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource) !ExitCause {
             const config = self.config;
+            defer if (self.devices.balloon_index != null) std.log.info("free-page reporting: returned_bytes={d}", .{self.devices.balloon.returned_bytes});
             var probe_done = false;
             var captured_request = false;
             var pressure_seen: u32 = 0;
@@ -1612,6 +1653,10 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                     };
                 }
                 self.growMemoryOnPressure(&pressure_seen) catch |err| {
+                    self.finish(.{ .err = err });
+                    continue;
+                };
+                self.returnFreePages() catch |err| {
                     self.finish(.{ .err = err });
                     continue;
                 };
@@ -1711,6 +1756,34 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                 break :delivered try flushRx(self.vm, &self.devices.vsock, self.devices.transports(), self.devices.vsock_index, self.ram);
             };
             if (delivered and Vm.spi_needs_kick) self.kickAll();
+        }
+
+        fn returnFreePages(self: *Self) !void {
+            const index = self.devices.balloon_index orelse return;
+            {
+                self.device_lock.lockUncancelable(self.config.io);
+                defer self.device_lock.unlock(self.config.io);
+                if (!self.devices.balloon.hasPending(&self.devices.transports()[index], self.ram)) return;
+            }
+            try self.pauseAll(.none);
+            defer self.resumeAll();
+            // A failed unmap/replace/remap must stop the run before any
+            // vCPU can resume against an incompletely restored mapping.
+            errdefer |err| self.finish(.{ .err = err });
+            self.device_lock.lockUncancelable(self.config.io);
+            defer self.device_lock.unlock(self.config.io);
+            if (try self.devices.balloon.process(&self.devices.transports()[index], self.ram, self, reclaimReportedRange)) {
+                try self.vm.setSpi(board.virtioDeviceIntid(@intCast(index)), true);
+            }
+        }
+
+        fn reclaimReportedRange(self: *Self, gpa: u64, len: u64) !void {
+            // The background sealer must neither read a replaced mapping
+            // nor publish the old chunk reference after the discard.
+            if (self.dirty_tracker) |tracker| tracker.mutex.lockUncancelable(self.config.io);
+            defer if (self.dirty_tracker) |tracker| tracker.mutex.unlock(self.config.io);
+            try self.vm.reclaimRam(self.ram, gpa, len);
+            if (self.dirty_tracker) |tracker| tracker.sealer.markHostDirtyRange(@intCast(gpa - self.ram.base), @intCast(len));
         }
 
         /// Asks the guest to plug more virtio-mem when the probe stream
@@ -2148,6 +2221,94 @@ test "file-backed RAM mappings isolate parent and siblings" {
     try std.testing.expectEqual(@as(u8, 0x42), stored[0]);
 }
 
+test "reported private RAM becomes zero without changing parent or sibling" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var backing = try tmp.dir.createFile(io, "parent", .{ .read = true });
+    defer backing.close(io);
+    const size = 3 * spore.chunk_size;
+    if (std.c.ftruncate(backing.handle, size) != 0) return error.IoFailed;
+    try backing.writePositionalAll(io, &.{0x37}, spore.chunk_size);
+    const parent = try mapFileBackedRamFd(backing.handle, size);
+    defer parent.deinit();
+    const child = try mapFileBackedRamFd(backing.handle, size);
+    defer child.deinit();
+    const sibling = try mapFileBackedRamFd(backing.handle, size);
+    defer sibling.deinit();
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(child.bytes.ptr) % spore.chunk_size);
+    child.bytes[spore.chunk_size] = 0xb9;
+    child.bytes[spore.chunk_size - 1] = 0x41;
+    child.bytes[2 * spore.chunk_size] = 0x92;
+    try replaceReportedRam(.{ .bytes = child.bytes, .base = board.ram_base }, board.ram_base + spore.chunk_size, spore.chunk_size);
+    try std.testing.expect(std.mem.allEqual(u8, child.bytes[spore.chunk_size .. 2 * spore.chunk_size], 0));
+    try std.testing.expectEqual(@as(u8, 0x41), child.bytes[spore.chunk_size - 1]);
+    try std.testing.expectEqual(@as(u8, 0x92), child.bytes[2 * spore.chunk_size]);
+    try std.testing.expectEqual(@as(u8, 0x37), parent.bytes[spore.chunk_size]);
+    try std.testing.expectEqual(@as(u8, 0x37), sibling.bytes[spore.chunk_size]);
+    var stored: [1]u8 = undefined;
+    _ = try backing.readPositionalAll(io, &stored, spore.chunk_size);
+    try std.testing.expectEqual(@as(u8, 0x37), stored[0]);
+    child.bytes[spore.chunk_size] = 0x55;
+    try std.testing.expectEqual(@as(u8, 0x37), parent.bytes[spore.chunk_size]);
+}
+
+test "pending reports survive transport checkpoints and replace dirty chunk refs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const mapping = try mapAnonymousRam(4 * spore.chunk_size);
+    defer mapping.deinit();
+    @memset(mapping.bytes, 0x68);
+    const Tracker = DirtyTracker(TestDirtyBackend);
+    var tracker = try Tracker.start(arena, std.testing.io, .{ .dir = tmp.root, .ram = mapping.bytes }, .{});
+    defer tracker.deinit();
+    const ram = guestmem.GuestRam{ .bytes = mapping.bytes, .base = board.ram_base, .dirty_context = &tracker, .dirty_fn = Tracker.markGuestWriteCallback };
+    var config = testBoot(.{ .vcpus = 2 });
+    config.free_page_reporting = true;
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+    const index = devices.balloon_index.?;
+    const transport = &devices.transports()[index];
+    try transport.applyRestoredFeatureState(mmio.status_driver_ok | mmio.status_features_ok, mmio.f_version_1 | balloon.feature_reporting);
+    transport.queues[balloon.reporting_queue] = .{ .size = 8, .ready = true, .desc_addr = ram.base, .avail_addr = ram.base + 0x400, .used_addr = ram.base + 0x800 };
+    try ram.write(u64, ram.base, ram.base + 2 * spore.chunk_size);
+    try ram.write(u32, ram.base + 8, spore.chunk_size);
+    try ram.write(u16, ram.base + 12, 2);
+    try ram.write(u16, ram.base + 0x402, 1);
+    try ram.write(u16, ram.base + 0x404, 0);
+
+    const saved = try captureTransports(arena, devices.transports());
+    try std.testing.expect(spore.hasFreePageReporting(saved));
+    var restored: Devices = undefined;
+    restored.init(&config, null);
+    defer restored.net.shutdown();
+    try applyTransports(restored.transports(), saved, ram);
+    try std.testing.expect(restored.balloon.hasPending(&restored.transports()[index], ram));
+
+    var vm: ThreadTestVm = .{};
+    var vcpus = [_]ThreadTestVcpu{
+        .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 }) },
+        .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 }) },
+    };
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, Tracker) = .{ .vm = &vm, .vcpus = &vcpus, .devices = &restored, .ram = ram, .config = &config, .dirty_tracker = &tracker };
+    defer threaded.deinit(std.testing.allocator);
+    try threaded.start(std.testing.allocator);
+    try threaded.returnFreePages();
+    try std.testing.expect(!restored.balloon.hasPending(&restored.transports()[index], ram));
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, ram.base + 0x802));
+    const memory = try tracker.finish();
+    const plan = try spore.validateMemoryForRam(memory, mapping.bytes.len);
+    try std.testing.expectEqual(@as(usize, 3), plan.nonzero_chunk_count);
+    const loaded = try arena.alloc(u8, mapping.bytes.len);
+    @memset(loaded, 0);
+    try spore.loadMemory(arena, tmp.root, memory, loaded);
+    try std.testing.expectEqualSlices(u8, mapping.bytes, loaded);
+}
+
 test "transport restore rejects unoffered block features" {
     var storage: [blk.sector_size]u8 = undefined;
     var block = blk.Blk.initWithOptions(.{ .memory = &storage }, .{});
@@ -2456,6 +2617,10 @@ const ThreadTestVm = struct {
     }
 
     pub fn applyGic(_: *ThreadTestVm, _: std.mem.Allocator, _: []ThreadTestVcpu, _: gicv3.State) !void {}
+
+    pub fn reclaimRam(_: *ThreadTestVm, ram: guestmem.GuestRam, gpa: u64, len: u64) !void {
+        try replaceReportedRam(ram, gpa, len);
+    }
 
     pub fn setCounter(self: *ThreadTestVm, guest_cntvct: u64) !void {
         self.counter = guest_cntvct;

@@ -622,6 +622,16 @@ const Vm = struct {
         self.setHotplugSlot(guest_addr, 0, 0) catch |err| std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
     }
 
+    pub fn reclaimRam(_: *const Vm, ram: guestmem.GuestRam, gpa: u64, len: u64) !void {
+        // Memslots retain their userspace addresses. MMU notifiers invalidate
+        // KVM's old translations as mmap replaces the reported range.
+        try vmm.replaceReportedRam(ram, gpa, len);
+        // MAP_FIXED creates a fresh VMA. Keep returned, aligned memory
+        // eligible for THP again rather than losing huge-page advice.
+        const bytes = try ram.slice(gpa, len);
+        std.posix.madvise(@alignCast(bytes.ptr), bytes.len, std.posix.MADV.HUGEPAGE) catch {};
+    }
+
     fn setHotplugSlot(self: *const Vm, guest_addr: u64, size: u64, userspace_addr: u64) !void {
         var region = kvm.UserspaceMemoryRegion{
             .slot = 1,

@@ -119,6 +119,7 @@ pub const Spec = struct {
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
     memory: memory_config.Config = .{},
+    free_page_reporting: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     startup_timeout_ms: u64 = 30_000,

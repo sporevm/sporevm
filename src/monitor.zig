@@ -382,6 +382,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
                 .manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &network),
             },
             .record = .{ .annotations = spec.annotations, .sessions = spec.sessions },
+            .free_page_reporting = spec.free_page_reporting,
             .console_sink = vm_session.consoleSink,
             .mode = .{ .monitor = .{
                 .control = server.control(),

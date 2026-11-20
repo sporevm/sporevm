@@ -386,6 +386,21 @@ const Vm = struct {
         _ = hvf.hv_vm_unmap(guest_addr, mapped_bytes);
     }
 
+    /// Caller has parked all vCPUs, drained disk workers and locked the
+    /// dirty tracker, if any. HVF must release the old physical-page pins.
+    pub fn reclaimRam(self: *const Vm, ram: guestmem.GuestRam, gpa: u64, len: u64) !void {
+        const bytes = try ram.slice(gpa, len);
+        try hvf.check(hvf.hv_vm_unmap(gpa, len), "hv_vm_unmap reported RAM");
+        try vmm.replaceReportedRam(ram, gpa, len);
+        const flags = if (self.dirty_tracker != null) hvf.MemoryFlags.rx else hvf.MemoryFlags.rwx;
+        try hvf.check(hvf.hv_vm_map(bytes.ptr, gpa, len, flags), "hv_vm_map reported RAM");
+        if (self.dirty_tracker) |tracker| {
+            const start: usize = @intCast((gpa - ram.base) / spore.chunk_size);
+            const count: usize = @intCast(len / spore.chunk_size);
+            @memset(tracker.backend.writable_chunks[start..][0..count], false);
+        }
+    }
+
     pub fn captureGic(_: *const Vm, arena: std.mem.Allocator, _: usize) !gicv3.State {
         return snapshot.captureGicState(arena);
     }

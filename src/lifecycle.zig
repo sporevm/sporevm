@@ -230,6 +230,7 @@ pub const CreateNamedOptions = struct {
     initial_command: []const []const u8 = &.{},
     network: spore_net_policy.Network = .disabled,
     memory: memory_config.Config = .{},
+    free_page_reporting: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     startup_timeout_ms: u64 = 30_000,
@@ -390,6 +391,7 @@ pub fn createNamedWithTiming(
         .network = try spore_net_policy.manifestNetworkFromOptions(arena, &options.network),
         .network_policy = try specNetworkPolicy(arena, &options.network),
         .memory = options.memory,
+        .free_page_reporting = options.free_page_reporting,
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
         .startup_timeout_ms = options.startup_timeout_ms,
@@ -555,7 +557,7 @@ pub fn restoreNamed(
     };
     const rootfs = try rootfs_input.resumeRootfsForRun(arena, manifest);
     const disk = try rootfs_input.resumeDiskForRun(arena, manifest);
-    if (rootfs == null and manifest.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
+    if (rootfs == null and manifest.devices.len != diskless_resume_device_count + @as(usize, @intFromBool(spore.hasFreePageReporting(manifest.devices)))) return error.UnsupportedLifecycleDeviceModel;
     const resume_generation = if (options.generation_path) |path| blk: {
         const params = attach_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
             error.BadGenerationPayload => return error.BadGenerationPayload,
@@ -1561,7 +1563,7 @@ fn startForkChildExecutable(
     const manifest = parsed_manifest.value;
 
     if (manifest.network != null) return error.UnsupportedNamedForkNetwork;
-    const expected_devices = diskless_resume_device_count + @as(usize, @intFromBool(base.rootfs != null));
+    const expected_devices = diskless_resume_device_count + @as(usize, @intFromBool(base.rootfs != null)) + @as(usize, @intFromBool(spore.hasFreePageReporting(manifest.devices)));
     if (manifest.devices.len != expected_devices) return error.UnsupportedNamedForkDisk;
     if (manifest.disk != null) return error.UnsupportedNamedForkDisk;
     const memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state);

@@ -51,6 +51,7 @@ pub const Session = struct {
     machine: Machine,
     /// On restore, 1 means "use the manifest's count".
     vcpus: topology.VcpuCount = 1,
+    free_page_reporting: bool = false,
     disks: runtime_disk.Options = .{},
     network: Network = .{},
     record: Record = .{},
@@ -233,6 +234,7 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
         },
         .vcpus = session.vcpus,
         .console_sink = session.console_sink,
+        .free_page_reporting = session.free_page_reporting,
         .disk_backend = disk.backend(),
         .root_blk_options = rootBlkOptions(context.environ_map, growth, &root_blk_stats),
         .context_disk_fd = context_disk_fd,
@@ -340,6 +342,7 @@ fn trackedCapture(session: Session) ?capture.Capture {
 
 /// The x86 board boots fresh machines only, without captures.
 fn x86Config(config: vmm.Config, mode: Mode) !x86_vm.Config {
+    if (config.free_page_reporting) return error.FreePageReportingUnsupported;
     const boot = switch (config.start) {
         .boot => |boot| boot,
         .restore => return error.UnsupportedBackend,
