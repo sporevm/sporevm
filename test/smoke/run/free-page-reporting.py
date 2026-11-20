@@ -16,6 +16,7 @@ spore, backend, output = sys.argv[1:]
 root = Path(output)
 cycles = int(os.environ.get("SPORE_REPORTING_CYCLES", "2"))
 hold = int(os.environ.get("SPORE_REPORTING_HOLD", "4"))
+benchmark = os.environ.get("SPORE_REPORTING_BENCHMARK") == "1"
 results = []
 
 
@@ -112,7 +113,7 @@ def hashes(directory):
 
 guest = ["--", "/bin/memreport", "256", str(cycles), str(hold)]
 for vcpus in (1, 2):
-    for enabled in (False, True):
+    for enabled in ((False, True) if benchmark else (True,)):
         label = f"vcpu{vcpus}-reporting{int(enabled)}"
         args = ["run", "--backend", backend, "--memory", "512mb", "--vcpus", str(vcpus), "--exec-timeout", "150s"]
         if enabled:

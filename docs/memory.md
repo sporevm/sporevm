@@ -86,8 +86,10 @@ mappings; the shared parent and siblings remain unchanged.
 `mise run smoke run/free-page-reporting` exercises allocation, free, re-touch,
 single-/multi-vCPU execution, save, fork, local-backing restore, verified-chunk
 restore and parent immutability. It prints host RSS and guest allocation-work
-throughput separately. `SPORE_REPORTING_CYCLES` increases samples. No automatic
-capacity-shrink policy is implemented.
+throughput separately. `SPORE_REPORTING_BENCHMARK=1` adds reporting-disabled
+throughput baselines; `SPORE_REPORTING_CYCLES` increases samples. The normal
+gate retains the asserted reporting-off/on checkpoint control without the
+extra benchmark runs. No automatic capacity-shrink policy is implemented.
 
 ## Manifest Authority
 
