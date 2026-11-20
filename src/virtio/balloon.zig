@@ -15,6 +15,15 @@ pub const reclaim_alignment: u64 = 2 * 1024 * 1024;
 // See docs/memory.md for the managed kernel's source references.
 pub const reporting_queue = 2;
 
+const Range = struct {
+    start: u64,
+    end: u64,
+
+    fn lessThan(_: void, a: Range, b: Range) bool {
+        return a.start < b.start;
+    }
+};
+
 pub const Balloon = struct {
     reporting: bool = false,
     returned_bytes: u64 = 0,
@@ -57,34 +66,46 @@ pub const Balloon = struct {
         if (!self.hasPending(transport, ram)) return false;
         const mapped_ram = guestmem.GuestRam{ .bytes = ram.bytes[0..@intCast(mapped_size)], .base = ram.base };
         const q = &transport.queues[reporting_queue];
-        var budget: queue.NotifyBudget = .{};
-        var completed = false;
-        while (budget.hasRemaining()) {
-            const chain = (q.popAvail(ram) catch break) orelse break;
-            budget.consume();
-            // Validate the whole copied chain before touching any backing.
-            // Linux uses device-writable descriptors for page reporting.
-            var valid = true;
+        // Resume vCPUs and service control requests between chains. Together
+        // with coalescing, a pause replaces at most max_chain_len mappings
+        // and at most mapped_size unique bytes, even for repeated aliases.
+        const chain = (q.popAvail(ram) catch return false) orelse return false;
+        // Validate the whole copied chain before touching any backing.
+        // Linux uses device-writable descriptors for page reporting.
+        var valid = true;
+        for (chain.segments.slice()) |seg| {
+            if (!seg.writable) valid = false;
+            _ = mapped_ram.slice(seg.addr, seg.data.len) catch {
+                valid = false;
+                continue;
+            };
+        }
+        if (valid) {
+            var ranges: [queue.max_chain_len]Range = undefined;
+            var count: usize = 0;
             for (chain.segments.slice()) |seg| {
-                if (!seg.writable) valid = false;
-                _ = mapped_ram.slice(seg.addr, seg.data.len) catch {
-                    valid = false;
-                    continue;
-                };
-            }
-            if (valid) for (chain.segments.slice()) |seg| {
                 if (seg.data.len < reclaim_alignment) continue;
                 const start = std.mem.alignForward(u64, seg.addr, reclaim_alignment);
                 const end = std.mem.alignBackward(u64, seg.addr + seg.data.len, reclaim_alignment);
                 if (start >= end) continue;
-                try reclaim(ctx, start, end - start);
-                self.returned_bytes +|= end - start;
-            };
-            try q.pushUsed(ram, chain.head, 0);
-            completed = true;
+                ranges[count] = .{ .start = start, .end = end };
+                count += 1;
+            }
+            std.mem.sort(Range, ranges[0..count], {}, Range.lessThan);
+            var index: usize = 0;
+            while (index < count) {
+                var range = ranges[index];
+                index += 1;
+                while (index < count and ranges[index].start <= range.end) : (index += 1) {
+                    range.end = @max(range.end, ranges[index].end);
+                }
+                try reclaim(ctx, range.start, range.end - range.start);
+                self.returned_bytes +|= range.end - range.start;
+            }
         }
-        if (completed) transport.interrupt_status |= 1;
-        return completed;
+        try q.pushUsed(ram, chain.head, 0);
+        transport.interrupt_status |= 1;
+        return true;
     }
 };
 
@@ -135,6 +156,46 @@ test "reports return only complete aligned pages and expire at acknowledgement" 
     try std.testing.expectEqual(@as(u8, 0x51), bytes[reclaim_alignment]);
     _ = transport.write(0x070, 0, ram);
     try std.testing.expect(!device.reporting);
+}
+
+test "overlapping reports bound each pause to one chain and unique mapped ranges" {
+    const bytes = try std.testing.allocator.alloc(u8, 6 * reclaim_alignment);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes[0..16384], 0);
+    const ram = guestmem.GuestRam{ .bytes = bytes, .base = 0 };
+    var device: Balloon = .{};
+    var transport = mmio.Transport.init(device.device());
+    try testQueue(&transport, ram, 3 * reclaim_alignment, 2 * reclaim_alignment, 3);
+    const q = &transport.queues[reporting_queue];
+    q.size = 256;
+    q.avail_addr = 0x2000;
+    q.used_addr = 0x3000;
+    for (1..queue.max_chain_len) |index| {
+        const addr = index * 16;
+        // Unsorted overlaps, then repeated aliases: the union is [2, 10) MiB.
+        try ram.write(u64, addr, if (index == 1) reclaim_alignment else 3 * reclaim_alignment);
+        try ram.write(u32, addr + 8, if (index == 1) 3 * reclaim_alignment else 2 * reclaim_alignment);
+        try ram.write(u16, addr + 12, if (index + 1 < queue.max_chain_len) 3 else 2);
+        try ram.write(u16, addr + 14, @intCast(index + 1));
+    }
+    // A hostile driver repeats the same head in every available slot.
+    try ram.write(u16, q.avail_addr + 2, q.size);
+    const Probe = struct {
+        calls: usize = 0,
+        bytes: u64 = 0,
+        fn reclaim(self: *@This(), gpa: u64, len: u64) !void {
+            try std.testing.expect(gpa >= reclaim_alignment and len <= 4 * reclaim_alignment);
+            try std.testing.expect(gpa - reclaim_alignment <= 4 * reclaim_alignment - len);
+            self.calls += 1;
+            self.bytes += len;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expect(try device.process(&transport, ram, ram.bytes.len, &probe, Probe.reclaim));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u64, 4 * reclaim_alignment), probe.bytes);
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, q.used_addr + 2));
+    try std.testing.expect(device.hasPending(&transport, ram));
 }
 
 test "mixed direction and malformed trailing descriptors cannot partially reclaim" {
@@ -205,28 +266,47 @@ fn fuzzReports(_: void, smith: *std.testing.Smith) !void {
     const start = if (smith.value(bool)) addr % reclaim_alignment + reclaim_alignment else addr;
     const size: u32 = if (smith.value(bool)) @intCast(len % (2 * reclaim_alignment) + reclaim_alignment) else len;
     const mapped_size = @as(u64, smith.value(u8) % 5) * reclaim_alignment;
-    try testQueue(&transport, ram, start, size, flags);
+    const second = smith.value(bool);
+    const second_start = @as(u64, smith.value(u8) % 3 + 1) * reclaim_alignment;
+    try testQueue(&transport, ram, start, size, flags | @as(u16, if (second) 1 else 0));
+    if (second) {
+        try ram.write(u64, 16, second_start);
+        try ram.write(u32, 24, reclaim_alignment);
+        try ram.write(u16, 28, 2);
+    }
     const Probe = struct {
-        start: u64,
-        size: u64,
+        mapped: u64,
         flags: u16,
+        blocks: [4]bool = @splat(false),
         bytes: u64 = 0,
         fn reclaim(self: *@This(), gpa: u64, count: u64) !void {
             try std.testing.expectEqual(@as(u16, 2), self.flags & 7);
-            try std.testing.expect(gpa >= self.start and count <= self.size and gpa - self.start <= self.size - count);
+            try std.testing.expect(count > 0 and count <= self.mapped and gpa <= self.mapped - count);
             try std.testing.expectEqual(@as(u64, 0), (gpa | count) % reclaim_alignment);
+            for (0..4) |block| {
+                const addr_block = block * reclaim_alignment;
+                if (gpa <= addr_block and addr_block - gpa < count) {
+                    try std.testing.expect(!self.blocks[block]);
+                    self.blocks[block] = true;
+                }
+            }
             self.bytes += count;
         }
     };
-    var probe = Probe{ .start = start, .size = size, .flags = flags };
+    var probe = Probe{ .mapped = mapped_size, .flags = flags };
     _ = try device.process(&transport, ram, mapped_size, &probe, Probe.reclaim);
     // Independent oracle: enumerate RAM blocks, rather than duplicating
     // the implementation's inward-rounding calculation.
     var expected: u64 = 0;
-    if (start < mapped_size and size <= mapped_size - start and flags & 6 == 2) {
+    if (start < mapped_size and size <= mapped_size - start and flags & 6 == 2 and
+        (!second or second_start + reclaim_alignment <= mapped_size))
+    {
         for (0..4) |block| {
             const gpa = block * reclaim_alignment;
-            if (start <= gpa and size >= reclaim_alignment and gpa - start <= size - reclaim_alignment) expected += reclaim_alignment;
+            const first_covers = start <= gpa and size >= reclaim_alignment and gpa - start <= size - reclaim_alignment;
+            const second_covers = second and gpa == second_start;
+            try std.testing.expectEqual(first_covers or second_covers, probe.blocks[block]);
+            if (first_covers or second_covers) expected += reclaim_alignment;
         }
     }
     try std.testing.expectEqual(expected, probe.bytes);
@@ -239,5 +319,7 @@ test "fuzz free-page reports" {
     const indirect = std.mem.toBytes([_]u64{ reclaim_alignment, reclaim_alignment, 6, 0, 0, 4 });
     const unmapped = std.mem.toBytes([_]u64{ 2 * reclaim_alignment, reclaim_alignment, 2, 0, 0, 2 });
     const boundary = std.mem.toBytes([_]u64{ 2 * reclaim_alignment, reclaim_alignment, 2, 0, 0, 3 });
-    try std.testing.fuzz({}, fuzzReports, .{ .corpus = &.{ &aligned, &unaligned, &overflow, &indirect, &unmapped, &boundary } });
+    const overlap = std.mem.toBytes([_]u64{ reclaim_alignment, 2 * reclaim_alignment, 2, 0, 0, 4, 1, 1 });
+    const reverse = std.mem.toBytes([_]u64{ 2 * reclaim_alignment, reclaim_alignment, 2, 0, 0, 4, 1, 0 });
+    try std.testing.fuzz({}, fuzzReports, .{ .corpus = &.{ &aligned, &unaligned, &overflow, &indirect, &unmapped, &boundary, &overlap, &reverse } });
 }

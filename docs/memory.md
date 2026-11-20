@@ -80,6 +80,11 @@ that page; a later touch may allocate another one. This does not add hugetlb
 support or change sharing/COW costs for live parent pages.
 
 The runner parks every vCPU and drains disk workers before changing backing.
+Each pause consumes one report chain, coalescing overlapping or adjacent aligned
+ranges. A pause therefore makes at most 64 mapping replacements and returns no
+more than the mapped RAM size in unique bytes; repeated descriptor aliases
+cannot amplify that work. Other chains stay pending for later pauses, allowing
+vCPUs to resume and monitor control requests to run between batches.
 HVF unmaps the reported GPA, replaces its host mapping with private anonymous
 zero RAM, then remaps it; KVM retains memslot addresses and invalidates old
 translations through the host MMU notifier path. Neither backend punches holes

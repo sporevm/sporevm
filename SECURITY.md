@@ -86,8 +86,11 @@ Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
   copied chain as device-writable and inside the actually guest-mapped RAM
   prefix before any discard. Reserved, unmapped hotplug tails invalidate the
   whole report, which is acknowledged without reclaim. Only full 2 MiB-aligned
-  subranges are replaced, with all vCPUs parked, disk workers drained and any
-  dirty sealer locked. Replacements are anonymous private zero RAM, never
+  subranges are replaced. Each pause consumes at most one chain; its aligned
+  ranges are coalesced so at most 64 mapping replacements cover at most the
+  mapped guest RAM size in unique bytes. Excess chains remain pending.
+  Replacements run with all vCPUs parked, disk workers drained and any dirty
+  sealer locked. They are anonymous private zero RAM, never
   writes or hole punches into shared backing. Used-ring acknowledgement ends
   ownership immediately; no completed-report address is retained for later
   discard. Balloon inflation, page poisoning, hints and stats are not offered.
